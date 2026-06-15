@@ -8,6 +8,18 @@
 #define ENABLE_CLASSIC
 #endif
 
+#ifndef ENABLE_LE_CENTRAL
+#define ENABLE_LE_CENTRAL
+#endif
+
+#ifndef ENABLE_LE_PERIPHERAL
+#define ENABLE_LE_PERIPHERAL
+#endif
+
+#ifndef HAVE_MALLOC
+#define HAVE_MALLOC
+#endif
+
 
 // CYW43 HCI Transport requires pre-buffer space for packet header
 

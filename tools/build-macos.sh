@@ -3,6 +3,9 @@ set -euo pipefail
 
 PICO_SDK_VERSION="2.2.0"
 TINYUSB_VERSION="0.20.0"
+FIRMWARE_TARGET="ds5_ns2pro_dongle"
+FIRMWARE_VERSION="1.0.0"
+FIRMWARE_OUTPUT="${FIRMWARE_TARGET}_v${FIRMWARE_VERSION}"
 BUILD_TYPE="Release"
 BUILD_DIR="build/wake"
 ENABLE_WAKE_HID="ON"
@@ -16,7 +19,7 @@ usage() {
   cat <<'USAGE'
 Usage: tools/build-macos.sh [options]
 
-Build DS5Dongle on macOS using a repo-local Pico SDK checkout.
+Build DS5_NS2Pro_Dongle on macOS using a repo-local Pico SDK checkout.
 
 Options:
   --standard          Build standard firmware without ENABLE_WAKE_HID.
@@ -235,8 +238,8 @@ echo "Configuring firmware..."
 cmake "${CMAKE_ARGS[@]}"
 
 echo "Building firmware..."
-cmake --build "$BUILD_DIR" --target ds5-bridge
+cmake --build "$BUILD_DIR" --target "$FIRMWARE_TARGET"
 
 echo
 echo "Built firmware:"
-echo "  $ROOT/$BUILD_DIR/ds5-bridge.uf2"
+echo "  $ROOT/$BUILD_DIR/$FIRMWARE_OUTPUT.uf2"

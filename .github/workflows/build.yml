@@ -1,21 +1,17 @@
-name: Build firmware
+name: Build
 
 on:
   push:
     branches:
       - "**"
+  pull_request:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
-    name: Build UF2 artifacts
     uses: ./.github/workflows/build-firmware.yml
     with:
-      version: ${{ github.sha }}   # reusable build shortens a full SHA to 7
-      picow: true
-      waveshare: true
-      no_batt_led_check: true
-      usbwake: true
+      version: dev

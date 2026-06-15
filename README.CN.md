@@ -1,53 +1,97 @@
-# Pico2W DualSense 5 Bridge
-[English](./README.md)
-> 将 Pico2W 变成 DS5 手柄的无线适配器
+# DS5 NS2Pro Dongle
 
-# 功能特点
- - 支持HD震动
+[English](README.md)
 
-# 使用方法
-1. 按住 Pico 上的BOOTSEL进入刷机
-2. 将 .uf2 文件拖入进去
-3. 将 DS5 手柄进入蓝牙配对模式
-4. Enjoy it
+这是基于 Raspberry Pi Pico 2 W 的固件。Pico 会枚举成 DualSense 兼容 USB 设备，并同时支持原始 DualSense 输入和 NS2Pro 输入。
 
-***你可能需要在控制器处于匹配模式时重新插拔 pico***
+桌面管理器单独发布在 [AizawaHikaru233/DS5-NS2Pro-Dongle-Manager](https://github.com/AizawaHikaru233/DS5-NS2Pro-Dongle-Manager)。
 
-- 手柄连接到pico以后，系统才会显示设备
+## 安装
 
-# Pico 配置调整
-你可以通过网页调整Pico的内部设置
+1. 从 [Releases](https://github.com/AizawaHikaru233/DS5_NS2Pro_Dongle/releases) 下载最新的 `ds5_ns2pro_dongle_v*.uf2`。
+2. 按住 Pico 2 W 的 `BOOTSEL` 并插入 USB。
+3. 把 UF2 文件复制到弹出的 `RPI-RP2` 磁盘。
+4. Pico 自动重启后，打开桌面管理器并配对手柄。
 
-- 用于正式固件: https://ds5.awalol.eu.org
-- 用于测试固件: https://ds5-dev.awalol.eu.org
+## 功能
 
-### Pico W 版本
+- 对外枚举为 DualSense 兼容 USB 设备。
+- 尽量保持原始 DS5 蓝牙路径接近上游 DS5Dongle。
+- 支持通过桌面桥接接入 NS2Pro 有线输入。
+- 支持 Pico 侧直接连接 NS2Pro 蓝牙输入。
+- NS2Pro 摇杆、陀螺仪、震动、触觉反馈和配对逻辑由固件处理。
+- 在可行范围内让 NS2Pro 设置独立于 DS5 设置。
+- 提供管理 HID 协议，用于配置、状态、配对和校准。
 
-Pico W 由于性能问题，只能支持震动，不支持扬声器。
-你可以通过开启 `-DPICO_W_BUILD=ON` 编译项去开启 Pico W 固件编译，或者在 Github Action 下载预编译的固件
+## 跟原版 DS5Dongle 的区别
 
-### USB 唤醒支持
-这是一项实验性的功能。如果你需要该功能，请前往 feat/usb-wake 分支进行编译，或者使用该分支对应的 Github Action 预编译固件。`ds5-bridge-wake.uf2` 为该功能的固件
+原版 [awalol/DS5Dongle](https://github.com/awalol/DS5Dongle) 主要负责把真实 DualSense 通过 Pico 蓝牙桥接为有线 DualSense 兼容 USB 设备。
 
-极为建议在使用该功能前阅读  #60 和 #61
+这个分支保留原始 DS5 路径，并额外加入 NS2Pro 路径：
 
-### 社区分支
-https://github.com/MarcelineVPQ/DS5Dongle-OLED-Edition
-https://github.com/zurce/DS5Dongle-OLED
+- 解析 NS2Pro 输入报告并转译为 DualSense 输入报告。
+- 通过 DualSense 报文层暴露 NS2Pro 陀螺仪，并使用 NS2Pro 专用校准。
+- 把 DS5 触觉反馈和普通震动转换为 NS2Pro 可识别的震动输出。
+- NS2Pro 有线和蓝牙输入默认共用一套逻辑配置。
+- DS5 和 NS2Pro 的配对服务可以共存，但固件同一时间专注于一个已连接手柄。
 
-# 当前问题:
-- 声音可能有点小卡顿
-- 由于编码需要，需要对pico进行超频，当前的参数是1.2V 320MHz。
-- 若您的pico使用该超频参数无法启动，请自行增加电压或者降低频率
+## 构建依赖
 
-# 未来计划
-请查看[DS5Dongle plan](https://github.com/users/awalol/projects/5)
+- CMake
+- Ninja
+- Python 3
+- Git
+- ARM GNU Toolchain `14.2.rel1`
+- Raspberry Pi Pico SDK `2.2.0`
+- TinyUSB `0.20.0`
 
-# 编译
-需要将pico sdk里面的tinyusb版本升级到最新
+Windows 构建脚本会自动安装或下载这些依赖。
 
-# 致谢
- - [rafaelvaloto/Pico_W-Dualsense](https://github.com/rafaelvaloto/Pico_W-Dualsense) - 灵感来源
- - [egormanga/SAxense](https://github.com/egormanga/SAxense) - 震动报文
- - [https://controllers.fandom.com/wiki/Sony_DualSense](https://controllers.fandom.com/wiki/Sony_DualSense) - 数据报文结构
- - [Paliverse/DualSenseX](https://github.com/Paliverse/DualSenseX) - 扬声器数据包报文
+## Windows 构建
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tools\build-windows.ps1 -Variant standard
+```
+
+输出：
+
+```text
+tools\ds5_ns2pro_dongle_v1.0.0.uf2
+%USERPROFILE%\Desktop\ds5_ns2pro_dongle_v1.0.0.uf2
+```
+
+## 手动构建
+
+```sh
+git submodule update --init --recursive
+cmake -S . -B build/standard -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DPICO_SDK_PATH=/path/to/pico-sdk \
+  -DENABLE_NS2PRO_SERIAL_BRIDGE=ON
+cmake --build build/standard --target ds5_ns2pro_dongle
+```
+
+## 一键发布
+
+GitHub Actions 里已经提供 `Release firmware`。
+
+1. 打开 Actions。
+2. 选择 `Release firmware`。
+3. 点击运行 workflow。
+4. 输入版本号，例如 `1.0.0`。
+
+workflow 会创建或更新 `v1.0.0` Release，构建 `ds5_ns2pro_dongle_v1.0.0.uf2`，并上传到 GitHub Release。
+
+## 参考来源
+
+- 原始固件来源：[awalol/DS5Dongle](https://github.com/awalol/DS5Dongle)
+- 桌面管理器来源：[GooGuJiang/ds5dongle-manager](https://github.com/GooGuJiang/ds5dongle-manager)
+- NS2Pro 蓝牙/配对参考：[LeonChrome/y700-switch2-pro-bridge](https://github.com/LeonChrome/y700-switch2-pro-bridge)
+- DualSense 报文参考：[controllers.fandom.com/wiki/Sony_DualSense](https://controllers.fandom.com/wiki/Sony_DualSense)
+- DualSense 触觉反馈 POC：[egormanga/SAxense](https://github.com/egormanga/SAxense)
+- DualSense 扬声器报文参考：[Paliverse/DualSenseX](https://github.com/Paliverse/DualSenseX)
+- Pico DualSense 灵感来源：[rafaelvaloto/Pico_W-Dualsense](https://github.com/rafaelvaloto/Pico_W-Dualsense)
+
+## 许可证
+
+MIT。来自上游项目的代码保留来源说明。

@@ -80,7 +80,7 @@ void state_update(const uint8_t *data, const uint8_t size) {
     state.UseRumbleNotHaptics = update.UseRumbleNotHaptics;
     state.EnableImprovedRumbleEmulation = update.EnableImprovedRumbleEmulation;
     copy_if_allowed(
-        update.UseRumbleNotHaptics || update.EnableRumbleEmulation,
+        update.UseRumbleNotHaptics || update.EnableRumbleEmulation || update.EnableImprovedRumbleEmulation,
         offsetof(SetStateData, RumbleEmulationRight),
         2
     );

@@ -16,6 +16,9 @@ set -euo pipefail
 BUILD_TYPE="${1:-Release}"
 BUILD_DIR="build/waveshare"
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+FIRMWARE_TARGET="ds5_ns2pro_dongle"
+FIRMWARE_VERSION="1.0.0"
+FIRMWARE_OUTPUT="${FIRMWARE_TARGET}_v${FIRMWARE_VERSION}"
 
 if [[ -z "${PICO_SDK_PATH:-}" ]]; then
     echo "PICO_SDK_PATH is not set. Set it to a pico-sdk checkout pinned to 2.2.0+TinyUSB 0.20.0." >&2
@@ -27,8 +30,8 @@ cmake -S . -B "${BUILD_DIR}" -G Ninja \
     -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
     -DWAVESHARE_RP2350B_PLUS_W_BUILD=ON \
     -DPICO_SDK_PATH="${PICO_SDK_PATH}"
-cmake --build "${BUILD_DIR}" --target ds5-bridge
+cmake --build "${BUILD_DIR}" --target "${FIRMWARE_TARGET}"
 
 echo
 echo "Build complete. UF2 at:"
-echo "  ${PROJECT_ROOT}/${BUILD_DIR}/ds5-bridge.uf2"
+echo "  ${PROJECT_ROOT}/${BUILD_DIR}/${FIRMWARE_OUTPUT}.uf2"

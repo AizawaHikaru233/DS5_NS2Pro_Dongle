@@ -26,5 +26,10 @@ std::vector<uint8_t> get_feature_data(uint8_t reportId,uint16_t len);
 void init_feature();
 void set_feature_data(uint8_t reportId, uint8_t* data,uint16_t len);
 void bt_inquiring_led();
+bool bt_classic_connected();
+bool bt_stack_ready();
+void bt_set_classic_pairing_enabled(bool enabled);
+void bt_set_classic_pairing_service_enabled(bool enabled);
+bool bt_classic_pairing_service_enabled();
 
 #endif //DS5_BRIDGE_BT_H

@@ -34,6 +34,12 @@
 #define ENABLE_SERIAL 0
 #endif
 
+#ifndef ENABLE_NS2PRO_SERIAL_BRIDGE
+#define ENABLE_NS2PRO_SERIAL_BRIDGE 0
+#endif
+
+#define ENABLE_USB_CDC (ENABLE_SERIAL || ENABLE_NS2PRO_SERIAL_BRIDGE)
+
 //--------------------------------------------------------------------+
 // Board Specific Configuration
 //--------------------------------------------------------------------+
@@ -101,7 +107,7 @@
 #else
 #define CFG_TUD_HID               1
 #endif
-#define CFG_TUD_CDC               ENABLE_SERIAL
+#define CFG_TUD_CDC               ENABLE_USB_CDC
 #define CFG_TUD_MSC               0
 #define CFG_TUD_MIDI              0
 #ifdef ENABLE_WAKE_HID
@@ -123,8 +129,8 @@
 #define CFG_TUD_AUDIO_FUNC_1_N_BYTES_PER_SAMPLE_RX      2
 #define CFG_TUD_AUDIO_FUNC_1_RESOLUTION_RX              16
 
-// Microphone (IN/TX) path: 2-channel, 16-bit
-#define CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_TX              2
+// Microphone (IN/TX) path: 1-channel, 16-bit
+#define CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_TX              1
 #define CFG_TUD_AUDIO_FUNC_1_N_BYTES_PER_SAMPLE_TX      2
 #define CFG_TUD_AUDIO_FUNC_1_RESOLUTION_TX              16
 
@@ -136,7 +142,7 @@
 #define CFG_TUD_AUDIO_FUNC_1_EP_IN_SZ_MAX           CFG_TUD_AUDIO_FUNC_1_FORMAT_1_EP_SZ_IN
 
 #define CFG_TUD_AUDIO_FUNC_1_EP_OUT_SW_BUF_SZ       (3 * CFG_TUD_AUDIO_FUNC_1_EP_OUT_SZ_MAX)
-#define CFG_TUD_AUDIO_FUNC_1_EP_IN_SW_BUF_SZ        (4 * CFG_TUD_AUDIO_FUNC_1_EP_IN_SZ_MAX)
+#define CFG_TUD_AUDIO_FUNC_1_EP_IN_SW_BUF_SZ        (16 * CFG_TUD_AUDIO_FUNC_1_EP_IN_SZ_MAX)
 
 // Enable OUT EP (speaker) and IN EP (mic)
 #define CFG_TUD_AUDIO_ENABLE_EP_OUT                 1
@@ -144,7 +150,7 @@
 
 // CDC FIFO size of TX and RX
 #define CFG_TUD_CDC_RX_BUFSIZE   64
-#define CFG_TUD_CDC_TX_BUFSIZE   64
+#define CFG_TUD_CDC_TX_BUFSIZE   128
 
 // CDC Endpoint transfer buffer size, more is faster
 // Leave it as default size (512 for HS, 64 for FS) unless your host application

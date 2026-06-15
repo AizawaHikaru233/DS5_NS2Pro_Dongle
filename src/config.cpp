@@ -11,10 +11,10 @@
 #include "utils.h"
 #include "hardware/flash.h"
 #include "hardware/sync.h"
-#include "pico/cyw43_arch.h"
+#include "pico_led.h"
 
 constexpr uint32_t CONFIG_MAGIC = 0x66ccff00;
-constexpr uint16_t CONFIG_VERSION = 2;
+constexpr uint16_t CONFIG_VERSION = 3;
 constexpr uint32_t CONFIG_FLASH_OFFSET = PICO_FLASH_SIZE_BYTES - FLASH_SECTOR_SIZE;
 static Config config{};
 bool is_dse = false;
@@ -29,22 +29,26 @@ uint32_t calc_config_crc(const Config &con) {
     return crc32(reinterpret_cast<const uint8_t *>(&con.body), sizeof(Config_body));
 }
 
+static void apply_runtime_config() {
+    pico_led_restore_configured_state();
+    set_volume(config.body.speaker_volume, config.body.headset_volume);
+    set_gain(config.body.speaker_gain);
+}
+
 const Config *flash_config() {
     return reinterpret_cast<const Config *>(XIP_BASE + CONFIG_FLASH_OFFSET);
 }
 
 void config_valid() {
     // valid config and set default value
-    if (config.magic != CONFIG_MAGIC) {
-        config.magic = CONFIG_MAGIC;
+    if (config.magic != CONFIG_MAGIC || config.size != sizeof(Config_body)) {
         printf("[Config] Config Magic Header is invalid\n");
-    }
-    if (config.size != sizeof(Config_body)) {
-        config.size = sizeof(Config_body);
         printf("[Config] Config Body size is invalid\n");
+        config_default();
+        return;
     }
     auto body = &config.body;
-    if (std::isnan(body->haptics_gain) || body->haptics_gain < 1.0f || body->haptics_gain > 2.0f) {
+    if (std::isnan(body->haptics_gain) || body->haptics_gain < 0.0f || body->haptics_gain > 2.0f) {
         body->haptics_gain = 1.0f;
         printf("[Config] Haptics Gain value is invalid\n");
     }
@@ -104,6 +108,37 @@ void config_valid() {
         body->ps_shortcut_enabled = 0;
         printf("[Config] ps_shortcut_enabled is invalid\n");
     }
+    if (body->ds5_left_stick_deadzone_percent > 30) {
+        body->ds5_left_stick_deadzone_percent = 3;
+        printf("[Config] ds5_left_stick_deadzone_percent is invalid\n");
+    }
+    if (body->ds5_right_stick_deadzone_percent > 30) {
+        body->ds5_right_stick_deadzone_percent = 0;
+        printf("[Config] ds5_right_stick_deadzone_percent is invalid\n");
+    }
+}
+
+void config_default() {
+    memset(&config, 0, sizeof(config));
+    config.magic = CONFIG_MAGIC;
+    config.size = sizeof(Config_body);
+    config.body.config_version = CONFIG_VERSION;
+    config.body.haptics_gain = 1.0f;
+    config.body.speaker_volume = 0;
+    config.body.headset_volume = 0;
+    config.body.sync_spk_headset_volume = 1;
+    config.body.speaker_gain = 2;
+    config.body.inactive_time = 30;
+    config.body.disable_inactive_disconnect = 0;
+    config.body.disable_pico_led = 0;
+    config.body.polling_rate_mode = 0;
+    config.body.audio_buffer_length = 64;
+    config.body.controller_mode = 2;
+    config.body.lock_volume = 0;
+    config.body.disable_usb_sn = 0;
+    config.body.ps_shortcut_enabled = 0;
+    config.body.ds5_left_stick_deadzone_percent = 3;
+    config.body.ds5_right_stick_deadzone_percent = 0;
 }
 
 void config_load() {
@@ -142,16 +177,11 @@ void set_config(const uint8_t *new_config, const uint16_t len) {
     const auto copy_len = len < sizeof(Config_body) ? len : sizeof(Config_body);
     memcpy(&config.body, new_config, copy_len);
     config_valid();
-    if (config.body.disable_pico_led) {
-        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, false);
-    }else {
-        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, true);
-    }
-    set_volume(config.body.speaker_volume,config.body.headset_volume);
-    set_gain(config.body.speaker_gain);
+    apply_runtime_config();
 }
 
 void set_config(const Config_body &new_config) {
     config.body = new_config;
     config_valid();
+    apply_runtime_config();
 }

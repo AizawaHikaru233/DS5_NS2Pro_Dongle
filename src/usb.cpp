@@ -9,9 +9,15 @@
 #include "bsp/board_api.h"
 #include "config.h"
 #include "state_mgr.h"
+#include "usb.h"
 
 uint8_t mute[2]; // 0: SPEAKER(0x02) 1: MIC(0x05)
 float volume[2] = {-100.0f,0.0f}; // 0: SPEAKER(0x02) 1: MIC(0x05)
+static bool g_usb_bridge_connected = true;
+static UsbBridgePersona g_usb_bridge_persona = USB_BRIDGE_PERSONA_MANAGER;
+static UsbBridgePersona g_usb_bridge_requested_persona = USB_BRIDGE_PERSONA_MANAGER;
+static absolute_time_t g_usb_bridge_reconnect_at = nil_time;
+static absolute_time_t g_usb_bridge_dualsense_hold_until = nil_time;
 
 #define UAC1_ENTITY_SPK_FEATURE_UNIT    0x02
 #define UAC1_ENTITY_MIC_FEATURE_UNIT    0x05
@@ -190,6 +196,82 @@ bool tud_audio_set_req_entity_cb(uint8_t rhport, tusb_control_request_t const *p
 void tud_hid_report_complete_cb(uint8_t instance, uint8_t const *report, uint16_t len) {
     (void) instance;
     (void) len;
+}
+
+void usb_bridge_connect() {
+    if (g_usb_bridge_connected) {
+        return;
+    }
+
+    tud_connect();
+    g_usb_bridge_connected = true;
+}
+
+void usb_bridge_disconnect() {
+    if (!g_usb_bridge_connected) {
+        return;
+    }
+
+    tud_disconnect();
+    g_usb_bridge_connected = false;
+}
+
+bool usb_bridge_is_connected() {
+    return g_usb_bridge_connected;
+}
+
+UsbBridgePersona usb_bridge_persona() {
+    return g_usb_bridge_persona;
+}
+
+bool usb_bridge_is_manager_persona() {
+    return g_usb_bridge_persona == USB_BRIDGE_PERSONA_MANAGER;
+}
+
+bool usb_bridge_is_dualsense_persona() {
+    return g_usb_bridge_persona == USB_BRIDGE_PERSONA_DUALSENSE;
+}
+
+void usb_bridge_hold_dualsense_for_ms(uint32_t hold_ms) {
+    if (hold_ms == 0) {
+        g_usb_bridge_dualsense_hold_until = nil_time;
+        return;
+    }
+    g_usb_bridge_dualsense_hold_until = delayed_by_ms(get_absolute_time(), hold_ms);
+    usb_bridge_request_persona(USB_BRIDGE_PERSONA_DUALSENSE);
+}
+
+bool usb_bridge_should_hold_dualsense() {
+    if (is_nil_time(g_usb_bridge_dualsense_hold_until)) {
+        return false;
+    }
+    if (absolute_time_diff_us(get_absolute_time(), g_usb_bridge_dualsense_hold_until) > 0) {
+        return true;
+    }
+    g_usb_bridge_dualsense_hold_until = nil_time;
+    return false;
+}
+
+void usb_bridge_request_persona(UsbBridgePersona persona) {
+    if (g_usb_bridge_requested_persona == persona) {
+        return;
+    }
+    g_usb_bridge_requested_persona = persona;
+    usb_bridge_disconnect();
+    g_usb_bridge_reconnect_at = delayed_by_ms(get_absolute_time(), 150);
+}
+
+void usb_bridge_task() {
+    if (is_nil_time(g_usb_bridge_reconnect_at)) {
+        return;
+    }
+    if (absolute_time_diff_us(get_absolute_time(), g_usb_bridge_reconnect_at) > 0) {
+        return;
+    }
+    g_usb_bridge_persona = g_usb_bridge_requested_persona;
+    tud_connect();
+    g_usb_bridge_connected = true;
+    g_usb_bridge_reconnect_at = nil_time;
 }
 
 #ifndef ENABLE_WAKE_HID

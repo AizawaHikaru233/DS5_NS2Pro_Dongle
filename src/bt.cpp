@@ -2,6 +2,7 @@
 // Created by awalol on 2026/3/4.
 //
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include "bt.h"
@@ -16,11 +17,23 @@
 #include "bsp/board_api.h"
 #include "classic/sdp_server.h"
 #include "config.h"
+#include "ns2pro_ds5_identity.h"
+#include "ns2pro_ble.h"
+#include "pico_led.h"
 #include "state_mgr.h"
+#include "usb.h"
 #include "wake.h"
 #include "pico/util/queue.h"
 #if ENABLE_BATT_LED
 #include "battery_led.h"
+#endif
+
+#ifndef ENABLE_SERIAL
+#define ENABLE_SERIAL 0
+#endif
+
+#ifndef ENABLE_NS2PRO_SERIAL_BRIDGE
+#define ENABLE_NS2PRO_SERIAL_BRIDGE 0
 #endif
 
 #define MTU_CONTROL 672
@@ -45,6 +58,9 @@ static uint16_t hid_interrupt_cid;
 static bt_data_callback_t bt_data_callback = nullptr;
 static bool check_dse = false;
 static int8_t bt_rssi = 0;
+static bool classic_pairing_enabled = true;
+static bool classic_pairing_service_enabled = true;
+static bool bt_stack_working = false;
 unordered_map<uint8_t, vector<uint8_t> > feature_data;
 queue_t send_fifo;
 
@@ -54,6 +70,37 @@ struct send_element {
 };
 
 absolute_time_t inactive_time = 0; // 手柄长时间静默
+
+static void bt_refresh_inquiry_state() {
+    if (!bt_stack_working) {
+        return;
+    }
+    gap_connectable_control(classic_pairing_service_enabled ? 1 : 0);
+    gap_discoverable_control(classic_pairing_service_enabled ? 1 : 0);
+    if (!classic_pairing_service_enabled) {
+        if (bt_inquiring) {
+            gap_inquiry_stop();
+            bt_inquiring = false;
+        }
+        return;
+    }
+    if (acl_handle != HCI_CON_HANDLE_INVALID || hid_interrupt_cid != 0 || device_found) {
+        if (bt_inquiring) {
+            gap_inquiry_stop();
+            bt_inquiring = false;
+        }
+        return;
+    }
+    if (classic_pairing_enabled) {
+        if (!bt_inquiring) {
+            gap_inquiry_start(30);
+            bt_inquiring = true;
+        }
+    } else if (bt_inquiring) {
+        gap_inquiry_stop();
+        bt_inquiring = false;
+    }
+}
 
 void bt_register_data_callback(bt_data_callback_t callback) {
     bt_data_callback = callback;
@@ -115,9 +162,6 @@ int bt_init() {
     gap_ssp_set_io_capability(SSP_IO_CAPABILITY_DISPLAY_YES_NO);
     gap_ssp_set_authentication_requirement(SSP_IO_AUTHREQ_MITM_PROTECTION_NOT_REQUIRED_GENERAL_BONDING);
 
-    gap_connectable_control(1);
-    gap_discoverable_control(1);
-
     hci_event_callback_registration.callback = &hci_packet_handler;
     hci_add_event_handler(&hci_event_callback_registration);
 
@@ -147,7 +191,8 @@ void bt_inquiring_led() {
     static bool led_status = false;
     if (!bt_inquiring) {
         if (led_status) {
-            cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, false);
+            pico_led_set(false);
+            led_status = false;
         }
         return;
     }
@@ -155,11 +200,11 @@ void bt_inquiring_led() {
     if (time_us_32() - last_time > 200 * 1000) {
         last_time = time_us_32();
         led_status = !led_status;
-        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, led_status);
+        pico_led_set(led_status);
     }
 }
 
-static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size) {
+static void __not_in_flash_func(hci_packet_handler)(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size) {
     (void) channel;
 
     const uint8_t event_type = hci_event_packet_get_type(packet);
@@ -169,9 +214,9 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
             const uint8_t state = btstack_event_state_get_state(packet);
             printf("[BT] State: %u\n", state);
             if (state == HCI_STATE_WORKING) {
+                bt_stack_working = true;
                 printf("[BT] Stack ready, start inquiry\n");
-                gap_inquiry_start(30);
-                bt_inquiring = true;
+                bt_refresh_inquiry_state();
             }
             break;
         }
@@ -213,9 +258,7 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
                 break;
             }
             if (event_type == HCI_EVENT_INQUIRY_COMPLETE) {
-                // gap_inquiry_start(30);
-                gap_connectable_control(1);
-                gap_discoverable_control(1);
+                bt_refresh_inquiry_state();
             }
             break;
         }
@@ -256,6 +299,7 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
                 acl_handle = handle;
                 bt_rssi = 0;
                 hci_event_connection_complete_get_bd_addr(packet, current_device_addr);
+                ns2pro_ble_on_classic_pair_success();
                 printf("[HCI] ACL connected handle=0x%04X\n", handle);
                 printf("[HCI] Request authentication on handle=0x%04X\n", handle);
                 hci_send_cmd(&hci_authentication_requested, handle);
@@ -346,7 +390,7 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
             hci_event_connection_request_get_bd_addr(packet, addr);
             const uint32_t cod = hci_event_connection_request_get_class_of_device(packet);
             printf("[HCI] Incoming ACL request from %s cod=0x%06x\n", bd_addr_to_str(addr), (unsigned int) cod);
-            if ((cod & 0x000F00) == 0x000500) {
+            if (classic_pairing_service_enabled && (cod & 0x000F00) == 0x000500) {
                 bd_addr_copy(current_device_addr, addr);
                 gap_inquiry_stop();
                 hci_send_cmd(&hci_accept_connection_request, addr, 0x01);
@@ -355,13 +399,18 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
         }
 
         case HCI_EVENT_DISCONNECTION_COMPLETE: {
-#if !ENABLE_SERIAL && !defined(ENABLE_WAKE_HID)
+            const hci_con_handle_t handle = hci_event_disconnection_complete_get_connection_handle(packet);
+            if (handle != acl_handle) {
+                break;
+            }
+#if !ENABLE_SERIAL && !ENABLE_NS2PRO_SERIAL_BRIDGE && !defined(ENABLE_WAKE_HID)
             // Without ENABLE_WAKE_HID we hide the USB device whenever no
             // controller is paired (upstream behavior). With wake enabled
             // we must stay on the bus across controller power-cycles, so
             // tud_suspend_cb can later fire and tud_remote_wakeup() can
             // signal a wake when the controller is turned back on.
-            tud_disconnect();
+            // USB visibility is synchronized centrally in main.cpp so NS2Pro
+            // can keep the DualSense interface alive when DS5 disconnects.
 #endif
             gap_connectable_control(1);
             gap_discoverable_control(1);
@@ -374,13 +423,13 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
             hid_interrupt_cid = 0;
             feature_data.clear();
             while (queue_try_remove(&send_fifo, NULL)) {}
-            cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, false);
+            pico_led_set(false);
 #if ENABLE_BATT_LED
             battery_led_on_disconnect();
 #endif
+            ns2pro_ble_on_classic_disconnect();
             printf("[HCI] Disconnected reason=0x%02X\n", reason);
-            gap_inquiry_start(30);
-            bt_inquiring = true;
+            bt_refresh_inquiry_state();
             break;
         }
 
@@ -394,7 +443,7 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
     }
 }
 
-static void l2cap_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size) {
+static void __not_in_flash_func(l2cap_packet_handler)(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size) {
     (void) channel;
 
     if (packet_type == L2CAP_DATA_PACKET) {
@@ -427,16 +476,10 @@ static void l2cap_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t 
                     printf("Connected DSE Controller\n");
                     check_dse = false;
                     is_dse = true;
-#if !ENABLE_SERIAL
-                    tud_connect();
-#endif
                 } else if (packet[0] == 0x02) {
                     printf("Connected DS5 Controller\n");
                     check_dse = false;
                     is_dse = false;
-#if !ENABLE_SERIAL
-                    tud_connect();
-#endif
                 }
             }
             if (packet[0] == 0xA3) {
@@ -475,9 +518,7 @@ static void l2cap_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t 
                     printf("[L2CAP] HID Interrupt opened cid=0x%04X\n", local_cid);
                     hid_interrupt_cid = local_cid;
 
-                    if (!get_config().disable_pico_led) {
-                        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, true);
-                    }
+                    pico_led_set(true);
                     inactive_time = get_absolute_time();
 
                     printf("Init DualSense\n");
@@ -563,7 +604,7 @@ static void l2cap_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t 
     }
 }
 
-void bt_write(const uint8_t *data, const uint16_t len) {
+void __not_in_flash_func(bt_write)(const uint8_t *data, const uint16_t len) {
     if (hid_interrupt_cid == 0) return;
     static send_element packet{};
     memset(packet.data, 0, 512);
@@ -581,9 +622,47 @@ void bt_write(const uint8_t *data, const uint16_t len) {
     }
 }
 
+bool bt_classic_connected() {
+    return acl_handle != HCI_CON_HANDLE_INVALID || hid_interrupt_cid != 0;
+}
+
+bool bt_stack_ready() {
+    return bt_stack_working;
+}
+
+void bt_set_classic_pairing_enabled(bool enabled) {
+    classic_pairing_enabled = enabled;
+    bt_refresh_inquiry_state();
+}
+
+void bt_set_classic_pairing_service_enabled(bool enabled) {
+    classic_pairing_service_enabled = enabled;
+    if (!enabled) {
+        classic_pairing_enabled = false;
+    }
+    bt_refresh_inquiry_state();
+}
+
+bool bt_classic_pairing_service_enabled() {
+    return classic_pairing_service_enabled;
+}
+
 vector<uint8_t> get_feature_data(uint8_t reportId, uint16_t len) {
+    (void) len;
     // 若为0x81则会请求新内容，其他若有旧数据则不进行请求
     auto ret = vector<uint8_t>{};
+    const bool ns2pro_local_identity = hid_control_cid == 0;
+#if ENABLE_NS2PRO_SERIAL_BRIDGE
+    if (ns2pro_local_identity) {
+        const Ns2ProIdentityProfile profile =
+            ns2pro_ble_connected() ? Ns2ProIdentityProfile::Ble : Ns2ProIdentityProfile::Wired;
+        std::vector<uint8_t> local_report =
+            ns2pro_build_local_feature_report(reportId, true, profile);
+        if (!local_report.empty()) {
+            return local_report;
+        }
+    }
+#endif
     if (feature_data.contains(reportId)) {
         ret = feature_data[reportId];
     }
@@ -603,6 +682,14 @@ vector<uint8_t> get_feature_data(uint8_t reportId, uint16_t len) {
 #endif
         }
     }
+#if ENABLE_NS2PRO_SERIAL_BRIDGE
+    if (ret.empty()) {
+        const bool ns2pro_tuned = ns2pro_local_identity;
+        const Ns2ProIdentityProfile profile =
+            ns2pro_ble_connected() ? Ns2ProIdentityProfile::Ble : Ns2ProIdentityProfile::Wired;
+        ret = ns2pro_build_local_feature_report(reportId, ns2pro_tuned, profile);
+    }
+#endif
     return ret;
 }
 

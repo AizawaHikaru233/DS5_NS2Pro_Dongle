@@ -7,24 +7,25 @@
     Installs every prerequisite (winget where possible, portable downloads as a
     fallback), fetches the pinned Raspberry Pi Pico SDK + TinyUSB, initialises
     this repo's submodules, then configures and builds the firmware with CMake +
-    Ninja. The resulting ds5-bridge.uf2 is copied next to this script and onto
+    Ninja. The resulting firmware UF2 is copied next to this script and onto
     your Desktop.
 
     The script is idempotent: re-running it skips anything already installed or
     downloaded.
 
 .PARAMETER Variant
-    standard (default) - normal firmware.
+    standard (default) - normal firmware with NS2Pro CDC serial bridge enabled.
     debug              - adds -DENABLE_SERIAL=ON -DENABLE_VERBOSE=ON.
     wake               - adds -DENABLE_WAKE_HID=ON (Wake-on-PS build).
+    pc-ns2pro-serial   - compatibility alias for explicitly building with the NS2Pro CDC serial bridge enabled.
 
 .PARAMETER Clean
     Delete the variant's build directory before configuring.
 
 .PARAMETER Repo
     When run standalone (the script is not inside a checkout), the project
-    git URL to clone. Defaults to the upstream project. Override to build a
-    fork.
+    git URL to clone. When omitted, the script must be run from inside an
+    existing checkout.
 
 .PARAMETER Ref
     Branch, tag or commit to build when cloned standalone. Empty = the
@@ -32,7 +33,7 @@
 
 .EXAMPLE
     # Standalone: download just this file anywhere and run it - it clones
-    # the project under %USERPROFILE%\.ds5-build and builds it.
+    # the project under %USERPROFILE%\.ds5-ns2pro-build and builds it.
     powershell -ExecutionPolicy Bypass -File .\build-windows.ps1
 
 .EXAMPLE
@@ -40,17 +41,17 @@
     powershell -ExecutionPolicy Bypass -File tools\build-windows.ps1 -Variant wake
 
 .EXAMPLE
-    powershell -ExecutionPolicy Bypass -File .\build-windows.ps1 -Repo https://github.com/youruser/DS5Dongle.git -Ref master
+    powershell -ExecutionPolicy Bypass -File .\build-windows.ps1 -Repo https://github.com/youruser/DS5_NS2Pro_Dongle.git -Ref main
 #>
 
 [CmdletBinding()]
 param(
-    [ValidateSet('standard', 'debug', 'wake')]
+    [ValidateSet('standard', 'debug', 'wake', 'pc-ns2pro-serial')]
     [string]$Variant = 'standard',
     [switch]$Clean,
     # Project to build when this script is run standalone (not from inside a
     # checkout). Override to build a fork.
-    [string]$Repo = 'https://github.com/awalol/DS5Dongle.git',
+    [string]$Repo = '',
     # Branch/tag/SHA to build when cloned standalone. Empty = default branch.
     [string]$Ref = ''
 )
@@ -70,20 +71,25 @@ $ARM_URL      = "https://developer.arm.com/-/media/Files/downloads/gnu/$ARM_VER/
 # Portable native host compiler (WinLibs MinGW-w64 UCRT) for pioasm/picotool.
 $MINGW_URL    = 'https://github.com/brechtsanders/winlibs_mingw/releases/download/14.2.0posix-19.1.1-12.0.0-ucrt-r2/winlibs-x86_64-posix-seh-gcc-14.2.0-mingw-w64ucrt-12.0.0-r2.zip'
 
-$ToolsHome = Join-Path $env:USERPROFILE '.ds5-build'
+$FirmwareProjectName = 'DS5_NS2Pro_Dongle'
+$FirmwareTarget = 'ds5_ns2pro_dongle'
+$FirmwareVersion = '1.0.0'
+$FirmwareBaseName = "${FirmwareTarget}_v${FirmwareVersion}"
+
+$ToolsHome = Join-Path $env:USERPROFILE '.ds5-ns2pro-build'
 $SdkPath   = Join-Path $ToolsHome 'pico-sdk'
 $ArmRoot   = Join-Path $ToolsHome 'arm-gnu-toolchain'
-$ClonePath = Join-Path $ToolsHome 'DS5Dongle'
+$ClonePath = Join-Path $ToolsHome $FirmwareProjectName
 # $RepoRoot is resolved at runtime (Resolve-RepoRoot) - either an existing
 # checkout this script sits in, or a fresh clone under $ToolsHome.
 $RepoRoot  = $null
 $GitExit   = 0     # last git exit code, set by Invoke-GitQuiet
 $PythonExe = $null # real Python 3 interpreter, set by Resolve-Python
 
-function Info  ($m) { Write-Host "[ds5] $m"            -ForegroundColor Cyan }
-function Ok    ($m) { Write-Host "[ds5] $m"            -ForegroundColor Green }
-function Warn  ($m) { Write-Host "[ds5] WARNING: $m"   -ForegroundColor Yellow }
-function Die   ($m) { Write-Host "[ds5] ERROR: $m"     -ForegroundColor Red; exit 1 }
+function Info  ($m) { Write-Host "[ds5-ns2pro] $m"          -ForegroundColor Cyan }
+function Ok    ($m) { Write-Host "[ds5-ns2pro] $m"          -ForegroundColor Green }
+function Warn  ($m) { Write-Host "[ds5-ns2pro] WARNING: $m" -ForegroundColor Yellow }
+function Die   ($m) { Write-Host "[ds5-ns2pro] ERROR: $m"   -ForegroundColor Red; exit 1 }
 
 function Have ($cmd) { [bool](Get-Command $cmd -ErrorAction SilentlyContinue) }
 
@@ -274,7 +280,7 @@ function Ensure-PicoSdk {
 function Test-Ds5Checkout ($dir) {
     if (-not $dir) { return $false }
     $cml = Join-Path $dir 'CMakeLists.txt'
-    return (Test-Path $cml) -and (Select-String -Path $cml -Pattern 'ds5-bridge' -Quiet)
+    return (Test-Path $cml) -and (Select-String -Path $cml -Pattern 'set\(FIRMWARE_TARGET\s+ds5_ns2pro_dongle\)' -Quiet)
 }
 
 # Runs git so NOTHING reaches the pipeline: every stream is written to the
@@ -307,6 +313,9 @@ function Resolve-RepoRoot {
             return
         }
     }
+    if ([string]::IsNullOrWhiteSpace($Repo)) {
+        Die "Run this script from inside a $FirmwareProjectName checkout, or pass -Repo explicitly."
+    }
     # Standalone: clone (or refresh) the project under $ToolsHome.
     if (Test-Path (Join-Path $ClonePath '.git')) {
         Info "Refreshing existing clone: $ClonePath"
@@ -330,7 +339,7 @@ function Resolve-RepoRoot {
         }
         if (-not (Test-Path (Join-Path $ClonePath '.git'))) { Die "Failed to clone $Repo" }
     }
-    if (-not (Test-Ds5Checkout $ClonePath)) { Die "Clone at $ClonePath is not a DS5Dongle project." }
+    if (-not (Test-Ds5Checkout $ClonePath)) { Die "Clone at $ClonePath is not a $FirmwareProjectName project." }
     $script:RepoRoot = $ClonePath
 }
 
@@ -401,7 +410,7 @@ function Resolve-Python {
 # ---------------------------------------------------------------------------- #
 #  Main                                                                        #
 # ---------------------------------------------------------------------------- #
-Info "DS5Dongle Windows builder (rev $SCRIPT_REV) - variant: $Variant"
+Info "$FirmwareProjectName Windows builder (rev $SCRIPT_REV) - variant: $Variant"
 New-Item -ItemType Directory -Force -Path $ToolsHome | Out-Null
 Add-CommonToolPaths
 
@@ -440,7 +449,7 @@ Ensure-PicoSdk
 # --- Locate / fetch the project source --------------------------------------
 Resolve-RepoRoot   # sets $script:RepoRoot
 if (-not $RepoRoot -or -not (Test-Ds5Checkout $RepoRoot)) {
-    Die "Could not locate the DS5Dongle source (resolved: '$RepoRoot')."
+    Die "Could not locate the $FirmwareProjectName source (resolved: '$RepoRoot')."
 }
 Ok "Project source: $RepoRoot"
 
@@ -460,26 +469,28 @@ $cmakeArgs = @(
     '-S', $RepoRoot, '-B', $buildDir, '-G', 'Ninja',
     '-DCMAKE_BUILD_TYPE=Release',
     "-DPICO_SDK_PATH=$SdkPath",
-    "-DPython3_EXECUTABLE=$($PythonExe -replace '\\','/')"
+    "-DPython3_EXECUTABLE=$($PythonExe -replace '\\','/')",
+    '-DENABLE_NS2PRO_SERIAL_BRIDGE=ON'
 )
 switch ($Variant) {
     'debug' { $cmakeArgs += @('-DENABLE_SERIAL=ON', '-DENABLE_VERBOSE=ON') }
     'wake'  { $cmakeArgs += @('-DENABLE_WAKE_HID=ON') }
+    'pc-ns2pro-serial' { }
 }
 
 Info "Configuring: cmake $($cmakeArgs -join ' ')"
 & cmake @cmakeArgs
 if ($LASTEXITCODE -ne 0) { Die 'CMake configure failed.' }
 
-Info 'Building ds5-bridge...'
-& cmake --build $buildDir --target ds5-bridge
+Info "Building $FirmwareTarget..."
+& cmake --build $buildDir --target $FirmwareTarget
 if ($LASTEXITCODE -ne 0) { Die 'Build failed.' }
 
 # --- Collect output ----------------------------------------------------------
-$uf2 = Join-Path $buildDir 'ds5-bridge.uf2'
+$uf2 = Join-Path $buildDir "$FirmwareBaseName.uf2"
 if (-not (Test-Path $uf2)) { Die "Expected $uf2 was not produced." }
 
-$outName = if ($Variant -eq 'standard') { 'ds5-bridge.uf2' } else { "ds5-bridge-$Variant.uf2" }
+$outName = if ($Variant -eq 'standard') { "$FirmwareBaseName.uf2" } else { "$FirmwareBaseName-$Variant.uf2" }
 $nextToScript = Join-Path $PSScriptRoot $outName
 Copy-Item $uf2 $nextToScript -Force
 $desktop = [Environment]::GetFolderPath('Desktop')

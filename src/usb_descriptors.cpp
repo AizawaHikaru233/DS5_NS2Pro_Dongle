@@ -26,10 +26,17 @@
 #include "bsp/board_api.h"
 #include "tusb.h"
 #include "config.h"
+#include "usb.h"
 
 #ifndef ENABLE_SERIAL
 #define ENABLE_SERIAL 0
 #endif
+
+#ifndef ENABLE_NS2PRO_SERIAL_BRIDGE
+#define ENABLE_NS2PRO_SERIAL_BRIDGE 0
+#endif
+
+#define ENABLE_USB_CDC (ENABLE_SERIAL || ENABLE_NS2PRO_SERIAL_BRIDGE)
 
 bool ds_mode() {
     if (get_config().controller_mode == 2) {
@@ -43,7 +50,7 @@ enum {
     ITF_NUM_AUDIO_STREAMING_OUT,
     ITF_NUM_AUDIO_STREAMING_IN,
     ITF_NUM_HID,
-#if ENABLE_SERIAL
+#if ENABLE_USB_CDC
     ITF_NUM_CDC,
     ITF_NUM_CDC_DATA,
 #endif
@@ -53,7 +60,7 @@ enum {
     ITF_NUM_TOTAL,
 
     CONFIG_DESC_LEN_AUDIO_IAD =
-#if ENABLE_SERIAL
+#if ENABLE_USB_CDC
         8,
 #else
         0,
@@ -68,7 +75,21 @@ enum {
         0,
 #endif
     CONFIG_DESC_LEN_TOTAL = CONFIG_DESC_LEN_BASE + CONFIG_DESC_LEN_WAKE_KBD
-#if ENABLE_SERIAL
+#if ENABLE_USB_CDC
+        + TUD_CDC_DESC_LEN
+#endif
+};
+
+enum {
+    MANAGER_ITF_NUM_HID = 0,
+#if ENABLE_USB_CDC
+    MANAGER_ITF_NUM_CDC,
+    MANAGER_ITF_NUM_CDC_DATA,
+#endif
+    MANAGER_ITF_NUM_TOTAL,
+    MANAGER_CONFIG_DESC_LEN_TOTAL =
+        9 + 9 + 9 + 7 + 7
+#if ENABLE_USB_CDC
         + TUD_CDC_DESC_LEN
 #endif
 };
@@ -79,7 +100,7 @@ enum {
     STRID_MANUFACTURER,
     STRID_PRODUCT,
     STRID_SERIAL,
-#if ENABLE_SERIAL
+#if ENABLE_USB_CDC
     STRID_CDC,
 #endif
 };
@@ -99,7 +120,7 @@ tusb_desc_device_t desc_device =
 
     // Use Interface Association Descriptor (IAD) for Audio
     // As required by USB Specs IAD's subclass must be common class (2) and protocol must be IAD (1)
-#if ENABLE_SERIAL
+#if ENABLE_USB_CDC
     .bDeviceClass = TUSB_CLASS_MISC,
     .bDeviceSubClass = MISC_SUBCLASS_COMMON,
     .bDeviceProtocol = MISC_PROTOCOL_IAD,
@@ -125,7 +146,13 @@ tusb_desc_device_t desc_device =
 // Invoked when received GET DEVICE DESCRIPTOR
 // Application return pointer to descriptor
 uint8_t const *tud_descriptor_device_cb(void) {
-    desc_device.idProduct = ds_mode() ? 0x0CE6 : 0x0DF2;
+    if (usb_bridge_is_manager_persona()) {
+        desc_device.idVendor = 0x2E8A;
+        desc_device.idProduct = 0x00D5;
+    } else {
+        desc_device.idVendor = 0x054C;
+        desc_device.idProduct = ds_mode() ? 0x0CE6 : 0x0DF2;
+    }
     desc_device.iSerialNumber = get_config().disable_usb_sn ? 0x00 : 0x03;
     return reinterpret_cast<uint8_t const *>(&desc_device);
 }
@@ -148,7 +175,7 @@ uint8_t descriptor_configuration[] = {
 #endif
     0xFA, // bMaxPower: 500mA (250 * 2mA)
 
-#if ENABLE_SERIAL
+#if ENABLE_USB_CDC
     // --- INTERFACE ASSOCIATION DESCRIPTOR: Audio function (interfaces 0-2) ---
     0x08, // bLength
     TUSB_DESC_INTERFACE_ASSOCIATION, // bDescriptorType
@@ -220,8 +247,8 @@ uint8_t descriptor_configuration[] = {
     0x04, // bTerminalID: 4
     0x02, 0x04, // wTerminalType: Headset (0x0402)
     0x03, // bAssocTerminal: 3 (paired with speaker)
-    0x02, // bNrChannels: 2
-    0x03, 0x00, // wChannelConfig: L/R Front (0x0003)
+    0x01, // bNrChannels: 1
+    0x00, 0x00, // wChannelConfig: non-predefined mono
     0x00, // iChannelNames: 0
     0x00, // iTerminal: 0
 
@@ -335,12 +362,12 @@ uint8_t descriptor_configuration[] = {
     0x01, // bDelay: 1 frame
     0x01, 0x00, // wFormatTag: PCM (0x0001)
 
-    // Format Type Descriptor (2-channel, 16-bit, 48kHz)
+    // Format Type Descriptor (1-channel, 16-bit, 48kHz)
     0x0B, // bLength: 11
     0x24, // bDescriptorType: CS_INTERFACE
     0x02, // bDescriptorSubtype: FORMAT_TYPE
     0x01, // bFormatType: TYPE_I
-    0x02, // bNrChannels: 2
+    0x01, // bNrChannels: 1
     0x02, // bSubframeSize: 2
     0x10, // bBitResolution: 16
     0x01, // bSamFreqType: 1
@@ -351,7 +378,7 @@ uint8_t descriptor_configuration[] = {
     0x05, // bDescriptorType (ENDPOINT)
     0x82, // bEndpointAddress: IN EP2
     0x05, // bmAttributes: Isochronous, Asynchronous
-    0xC4, 0x00, // wMaxPacketSize: 196 bytes
+    0x62, 0x00, // wMaxPacketSize: 98 bytes
     0x01, // bInterval: 1
     0x00, // bRefresh
     0x00, // bSynchAddress
@@ -401,7 +428,7 @@ uint8_t descriptor_configuration[] = {
     0x40, 0x00, // wMaxPacketSize: 64
     0x01, // bInterval: 1 (polling every 4ms -> 1ms)
 
-#if ENABLE_SERIAL
+#if ENABLE_USB_CDC
     // --- CDC ACM (USB Serial) ---
     TUD_CDC_DESCRIPTOR(ITF_NUM_CDC, STRID_CDC, 0x85, 0x08, 0x06, 0x86, 0x40),
 #endif
@@ -438,11 +465,61 @@ uint8_t descriptor_configuration[] = {
 #endif
 };
 
+uint8_t manager_descriptor_configuration[] = {
+    0x09,
+    0x02,
+    U16_TO_U8S_LE(MANAGER_CONFIG_DESC_LEN_TOTAL),
+    MANAGER_ITF_NUM_TOTAL,
+    0x01,
+    0x00,
+    0xC0,
+    0xFA,
+
+    0x09,
+    0x04,
+    MANAGER_ITF_NUM_HID,
+    0x00,
+    0x02,
+    0x03,
+    0x00,
+    0x00,
+    0x00,
+
+    0x09,
+    0x21,
+    0x11, 0x01,
+    0x00,
+    0x01,
+    0x22,
+    U16_TO_U8S_LE(48),
+
+    0x07,
+    0x05,
+    0x84,
+    0x03,
+    0x40, 0x00,
+    0x01,
+
+    0x07,
+    0x05,
+    0x03,
+    0x03,
+    0x40, 0x00,
+    0x01,
+
+#if ENABLE_USB_CDC
+    TUD_CDC_DESCRIPTOR(MANAGER_ITF_NUM_CDC, STRID_CDC, 0x85, 0x08, 0x06, 0x86, 0x40),
+#endif
+};
+
 // Invoked when received GET CONFIGURATION DESCRIPTOR
 // Application return pointer to descriptor
 // Descriptor contents must exist long enough for transfer to complete
 uint8_t const *tud_descriptor_configuration_cb(uint8_t index) {
     (void) index; // for multiple configurations
+    if (usb_bridge_is_manager_persona()) {
+        return manager_descriptor_configuration;
+    }
     auto bInterval = 0x01;
     switch (get_config().polling_rate_mode) {
         case 0:
@@ -469,6 +546,34 @@ uint8_t const *tud_descriptor_configuration_cb(uint8_t index) {
 //--------------------------------------------------------------------+
 // HID Report Descriptor
 //--------------------------------------------------------------------+
+
+uint8_t const desc_hid_report_manager[] = {
+    0x06, 0x00, 0xFF,
+    0x09, 0x01,
+    0xA1, 0x01,
+    0x85, 0xF6,
+    0x09, 0x37,
+    0x95, 0x3F,
+    0x75, 0x08,
+    0xB1, 0x02,
+    0x85, 0xF7,
+    0x09, 0x38,
+    0x95, 0x3F,
+    0x75, 0x08,
+    0xB1, 0x02,
+    0x85, 0xF8,
+    0x09, 0x39,
+    0x95, 0x3F,
+    0x75, 0x08,
+    0xB1, 0x02,
+    0x85, 0xF9,
+    0x09, 0x3A,
+    0x95, 0x3F,
+    0x75, 0x08,
+    0xB1, 0x02,
+    0xC0,
+};
+static_assert(sizeof(desc_hid_report_manager) == 48);
 
 uint8_t const desc_hid_report_ds[] = {
     0x05, 0x01, // Usage Page (Generic Desktop Ctrls)
@@ -894,6 +999,9 @@ uint8_t const *tud_hid_descriptor_report_cb(uint8_t itf) {
     if (itf == 1) return desc_hid_report_kbd;
 #endif
     (void) itf;
+    if (usb_bridge_is_manager_persona()) {
+        return desc_hid_report_manager;
+    }
     if (ds_mode()) {
         return desc_hid_report_ds;
     }
@@ -911,7 +1019,7 @@ static char const *string_desc_arr[] =
     "Sony Interactive Entertainment", // 1: Manufacturer
     NULL, // 2: Product
     NULL, // 3: Serials will use unique ID if possible
-#if ENABLE_SERIAL
+#if ENABLE_USB_CDC
     "USB Serial", // 4: CDC interface
 #endif
 };
@@ -928,6 +1036,12 @@ uint16_t const *tud_descriptor_string_cb(uint8_t index, uint16_t langid) {
         string_desc_arr[2] = "DualSense Wireless Controller";
     }else {
         string_desc_arr[2] = "DualSense Edge Wireless Controller";
+    }
+    if (usb_bridge_is_manager_persona()) {
+        string_desc_arr[1] = "Raspberry Pi";
+        string_desc_arr[2] = "Pico Manager HID";
+    } else {
+        string_desc_arr[1] = "Sony Interactive Entertainment";
     }
 
     switch (index) {

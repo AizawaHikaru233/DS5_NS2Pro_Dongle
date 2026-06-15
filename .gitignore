@@ -3,3 +3,8 @@ build
 .vscode
 .idea
 example
+tools/*.uf2
+*.map
+*.elf
+*.bin
+*.hex
