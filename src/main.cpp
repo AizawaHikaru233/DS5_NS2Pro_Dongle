@@ -6,6 +6,7 @@
 #include <cstdio>
 #include "bsp/board_api.h"
 #include "bt.h"
+#include "button_mapping.h"
 #include "utils.h"
 #include "resample.h"
 #include "audio.h"
@@ -395,6 +396,7 @@ void __not_in_flash_func(on_bt_data)(CHANNEL_TYPE channel, uint8_t *data, uint16
         if (get_config().polling_rate_mode != 2) {
             memcpy(interrupt_in_data, data + 3, 63);
             ds5_apply_input_tuning(interrupt_in_data, sizeof(interrupt_in_data));
+            button_mapping_apply_ds5(interrupt_in_data, sizeof(interrupt_in_data));
 #if ENABLE_BATT_LED
             battery_led_note_report();
 #endif
@@ -410,6 +412,7 @@ void __not_in_flash_func(on_bt_data)(CHANNEL_TYPE channel, uint8_t *data, uint16
         critical_section_enter_blocking(&report_cs);
         memcpy(interrupt_in_data, data + 3, 63);
         ds5_apply_input_tuning(interrupt_in_data, sizeof(interrupt_in_data));
+        button_mapping_apply_ds5(interrupt_in_data, sizeof(interrupt_in_data));
         report_dirty = true;
         critical_section_exit(&report_cs);
 #if ENABLE_BATT_LED
@@ -567,6 +570,7 @@ int main() {
     wake_init();
 
     ns2pro_config_load();
+    button_mapping_load();
     ns2pro_wired_bond_saved = get_ns2pro_config().ble_has_target != 0;
     pico_cmd_set_ns2pro_ble_has_bond(ns2pro_wired_bond_saved);
     pico_cmd_set_ns2pro_ble_state(NS2PRO_BLE_STATE_IDLE);

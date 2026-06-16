@@ -10,6 +10,7 @@
 
 #include "bridge_manager_config.h"
 #include "bt.h"
+#include "button_mapping.h"
 #include "config.h"
 #include "device/usbd.h"
 #include "ns2pro_ble.h"
@@ -76,7 +77,9 @@ bool is_pico_cmd(uint8_t report_id) {
     if (report_id == 0xf6 ||
         report_id == 0xf7 ||
         report_id == 0xf8 ||
-        report_id == 0xf9
+        report_id == 0xf9 ||
+        report_id == 0xfa ||
+        report_id == 0xfb
     ) {
         return true;
     }
@@ -115,6 +118,12 @@ uint16_t pico_cmd_get(uint8_t report_id, uint8_t *buffer, uint16_t reqlen) {
                rssi);
 #endif
         return len;
+    }
+    if (report_id == 0xfa) {
+        return static_cast<uint16_t>(button_mapping_get_ds5(buffer, reqlen));
+    }
+    if (report_id == 0xfb) {
+        return static_cast<uint16_t>(button_mapping_get_ns2pro(buffer, reqlen));
     }
     return 0;
 }
@@ -155,6 +164,15 @@ void pico_cmd_set(uint8_t report_id, uint8_t const *buffer, uint16_t bufsize) {
     }
     if (buffer[0] == CMD_UPDATE_NS2PRO_CONFIG) {
         set_ns2pro_config(buffer + 1, bufsize - 1);
+    }
+    if (buffer[0] == CMD_UPDATE_DS5_BUTTON_MAPPING) {
+        button_mapping_set_ds5(buffer + 1, bufsize - 1);
+    }
+    if (buffer[0] == CMD_UPDATE_NS2PRO_BUTTON_MAPPING) {
+        button_mapping_set_ns2pro(buffer + 1, bufsize - 1);
+    }
+    if (buffer[0] == CMD_SAVE_BUTTON_MAPPING) {
+        button_mapping_save();
     }
     if (buffer[0] == CMD_SAVE_NS2PRO_CONFIG) {
         ns2pro_config_save();

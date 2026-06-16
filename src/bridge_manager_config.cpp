@@ -6,6 +6,7 @@
 
 #include "config.h"
 #include "ns2pro_config.h"
+#include "button_mapping.h"
 
 namespace {
 
@@ -61,7 +62,7 @@ BridgeManagerConfigBody build_manager_config() {
 
 void apply_manager_config(const BridgeManagerConfigBody &body) {
     auto cfg = get_config();
-    cfg.config_version = 3;
+    cfg.config_version = get_config().config_version;
     cfg.haptics_gain = clamp_float(body.ds5_haptics_gain, 0.0f, 2.0f);
     const uint8_t mapped_speaker_volume = manager_speaker_volume_to_firmware(body.speaker_volume);
     cfg.speaker_volume = mapped_speaker_volume;
@@ -78,7 +79,7 @@ void apply_manager_config(const BridgeManagerConfigBody &body) {
     set_config(cfg);
 
     auto ns2_cfg = get_ns2pro_config();
-    ns2_cfg.config_version = 1;
+    ns2_cfg.config_version = get_ns2pro_config().config_version;
     ns2_cfg.rumble_gain = round_to_step(clamp_float(body.ns2pro_rumble_gain, 0.0f, 2.0f), 0.01f);
     ns2_cfg.rumble_style = clamp_u8(body.ns2pro_rumble_style, 0, 1);
     ns2_cfg.ble_has_target = body.ns2pro_ble_has_target ? 1 : 0;
@@ -117,5 +118,6 @@ void bridge_manager_config_set(const uint8_t *buffer, uint16_t len) {
 bool bridge_manager_config_save() {
     const bool config_saved = config_save();
     const bool ns2pro_config_saved = ns2pro_config_save();
-    return config_saved && ns2pro_config_saved;
+    const bool button_mapping_saved = button_mapping_save();
+    return config_saved && ns2pro_config_saved && button_mapping_saved;
 }

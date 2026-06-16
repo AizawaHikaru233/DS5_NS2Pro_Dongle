@@ -18,7 +18,10 @@ struct __attribute__((packed)) Ns2ProConfigBody {
     int16_t center_rx;
     int16_t center_ry;
     uint8_t gyro_invert_y;
-    uint8_t reserved[7];
+    uint8_t auto_gyro_center;
+    int16_t gyro_center_x;
+    int16_t gyro_center_y;
+    int16_t gyro_center_z;
 };
 
 struct __attribute__((packed)) Ns2ProConfig {

@@ -5,12 +5,13 @@
 
 #include "hardware/flash.h"
 #include "hardware/sync.h"
+#include "ns2pro_translator.h"
 #include "utils.h"
 
 namespace {
 
 constexpr uint32_t NS2PRO_CONFIG_MAGIC = 0x4e325043;
-constexpr uint16_t NS2PRO_CONFIG_VERSION = 1;
+constexpr uint16_t NS2PRO_CONFIG_VERSION = 3;
 constexpr uint32_t NS2PRO_CONFIG_FLASH_OFFSET = PICO_FLASH_SIZE_BYTES - (2 * FLASH_SECTOR_SIZE);
 
 Ns2ProConfig config{};
@@ -50,6 +51,11 @@ void ns2pro_config_default() {
     config.body.center_rx = 2048;
     config.body.center_ry = 2048;
     config.body.gyro_invert_y = 1;
+    config.body.auto_gyro_center = 1;
+    config.body.gyro_center_x = 0;
+    config.body.gyro_center_y = 0;
+    config.body.gyro_center_z = 0;
+    ns2pro_reset_runtime_calibration_from_config();
 }
 
 void ns2pro_config_valid() {
@@ -59,7 +65,15 @@ void ns2pro_config_valid() {
     }
 
     auto &body = config.body;
-    if (body.config_version != NS2PRO_CONFIG_VERSION) {
+    if (body.config_version > NS2PRO_CONFIG_VERSION) {
+        body.config_version = NS2PRO_CONFIG_VERSION;
+    } else if (body.config_version < 2) {
+        body.config_version = NS2PRO_CONFIG_VERSION;
+        body.auto_gyro_center = 1;
+        body.gyro_center_x = 0;
+        body.gyro_center_y = 0;
+        body.gyro_center_z = 0;
+    } else if (body.config_version != NS2PRO_CONFIG_VERSION) {
         body.config_version = NS2PRO_CONFIG_VERSION;
     }
     if (std::isnan(body.rumble_gain) || body.rumble_gain < 0.0f || body.rumble_gain > 2.0f) {
@@ -86,11 +100,15 @@ void ns2pro_config_valid() {
     if (body.gyro_invert_y > 1) {
         body.gyro_invert_y = 1;
     }
+    if (body.auto_gyro_center > 1) {
+        body.auto_gyro_center = 1;
+    }
 }
 
 void ns2pro_config_load() {
     memcpy(&config, flash_config(), sizeof(config));
     ns2pro_config_valid();
+    ns2pro_reset_runtime_calibration_from_config();
 }
 
 bool ns2pro_config_save() {
@@ -117,9 +135,11 @@ void set_ns2pro_config(const uint8_t *new_config, uint16_t len) {
     const auto copy_len = len < sizeof(Ns2ProConfigBody) ? len : sizeof(Ns2ProConfigBody);
     memcpy(&config.body, new_config, copy_len);
     ns2pro_config_valid();
+    ns2pro_reset_runtime_calibration_from_config();
 }
 
 void set_ns2pro_config(const Ns2ProConfigBody &new_config) {
     config.body = new_config;
     ns2pro_config_valid();
+    ns2pro_reset_runtime_calibration_from_config();
 }

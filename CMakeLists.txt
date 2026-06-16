@@ -121,6 +121,7 @@ add_executable(${PROJECT_NAME}
         src/bt.cpp
         src/config.cpp
         src/cmd.cpp
+        src/button_mapping.cpp
         src/bridge_manager_config.cpp
         src/ds5_input_tuning.cpp
         src/pico_led.cpp

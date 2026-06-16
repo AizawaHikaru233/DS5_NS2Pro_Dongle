@@ -92,7 +92,10 @@ void config_valid() {
         body->controller_mode = 2;
         printf("[Config] controller_mode is invalid\n");
     }
-    if (body->config_version != CONFIG_VERSION) {
+    if (body->config_version > CONFIG_VERSION) {
+        body->config_version = CONFIG_VERSION;
+        printf("[Config] Warning: Config version is newer than firmware, clamping\n");
+    } else if (body->config_version != CONFIG_VERSION) {
         body->config_version = CONFIG_VERSION;
         printf("[Config] Warning: Config may breaking change\n");
     }

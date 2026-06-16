@@ -4,32 +4,10 @@
 #include <cmath>
 #include <cstring>
 
+#include "button_mapping.h"
 #include "ns2pro_config.h"
 
 namespace {
-
-enum Ns2ProButtons : uint32_t {
-    ButtonB = 1u << 0,
-    ButtonA = 1u << 1,
-    ButtonY = 1u << 2,
-    ButtonX = 1u << 3,
-    ButtonR = 1u << 4,
-    ButtonZR = 1u << 5,
-    ButtonPlus = 1u << 6,
-    ButtonRightStick = 1u << 7,
-    ButtonDown = 1u << 8,
-    ButtonRight = 1u << 9,
-    ButtonLeft = 1u << 10,
-    ButtonUp = 1u << 11,
-    ButtonL = 1u << 12,
-    ButtonZL = 1u << 13,
-    ButtonMinus = 1u << 14,
-    ButtonLeftStick = 1u << 15,
-    ButtonHome = 1u << 16,
-    ButtonCapture = 1u << 17,
-    ButtonGR = 1u << 18,
-    ButtonGL = 1u << 19,
-};
 
 uint16_t unpack12_x(const uint8_t *data) {
     return static_cast<uint16_t>(data[0] | ((data[1] & 0x0f) << 8));
@@ -41,26 +19,26 @@ uint16_t unpack12_y(const uint8_t *data) {
 
 uint32_t map_buttons(const uint8_t *raw) {
     uint32_t buttons = 0;
-    if (raw[0] & 0x01) buttons |= ButtonY;
-    if (raw[0] & 0x02) buttons |= ButtonX;
-    if (raw[0] & 0x04) buttons |= ButtonB;
-    if (raw[0] & 0x08) buttons |= ButtonA;
-    if (raw[0] & 0x40) buttons |= ButtonR;
-    if (raw[0] & 0x80) buttons |= ButtonZR;
-    if (raw[1] & 0x01) buttons |= ButtonMinus;
-    if (raw[1] & 0x02) buttons |= ButtonPlus;
-    if (raw[1] & 0x04) buttons |= ButtonRightStick;
-    if (raw[1] & 0x08) buttons |= ButtonLeftStick;
-    if (raw[1] & 0x10) buttons |= ButtonHome;
-    if (raw[1] & 0x20) buttons |= ButtonCapture;
-    if (raw[2] & 0x01) buttons |= ButtonDown;
-    if (raw[2] & 0x02) buttons |= ButtonUp;
-    if (raw[2] & 0x04) buttons |= ButtonRight;
-    if (raw[2] & 0x08) buttons |= ButtonLeft;
-    if (raw[2] & 0x40) buttons |= ButtonL;
-    if (raw[2] & 0x80) buttons |= ButtonZL;
-    if (raw[3] & 0x01) buttons |= ButtonGR;
-    if (raw[3] & 0x02) buttons |= ButtonGL;
+    if (raw[0] & 0x01) buttons |= 1u << kNs2ProButtonInputY;
+    if (raw[0] & 0x02) buttons |= 1u << kNs2ProButtonInputX;
+    if (raw[0] & 0x04) buttons |= 1u << kNs2ProButtonInputB;
+    if (raw[0] & 0x08) buttons |= 1u << kNs2ProButtonInputA;
+    if (raw[0] & 0x40) buttons |= 1u << kNs2ProButtonInputR;
+    if (raw[0] & 0x80) buttons |= 1u << kNs2ProButtonInputZR;
+    if (raw[1] & 0x01) buttons |= 1u << kNs2ProButtonInputMinus;
+    if (raw[1] & 0x02) buttons |= 1u << kNs2ProButtonInputPlus;
+    if (raw[1] & 0x04) buttons |= 1u << kNs2ProButtonInputR3;
+    if (raw[1] & 0x08) buttons |= 1u << kNs2ProButtonInputL3;
+    if (raw[1] & 0x10) buttons |= 1u << kNs2ProButtonInputHome;
+    if (raw[1] & 0x20) buttons |= 1u << kNs2ProButtonInputCapture;
+    if (raw[2] & 0x01) buttons |= 1u << kNs2ProButtonInputDown;
+    if (raw[2] & 0x02) buttons |= 1u << kNs2ProButtonInputUp;
+    if (raw[2] & 0x04) buttons |= 1u << kNs2ProButtonInputRight;
+    if (raw[2] & 0x08) buttons |= 1u << kNs2ProButtonInputLeft;
+    if (raw[2] & 0x40) buttons |= 1u << kNs2ProButtonInputL;
+    if (raw[2] & 0x80) buttons |= 1u << kNs2ProButtonInputZL;
+    if (raw[3] & 0x01) buttons |= 1u << kNs2ProButtonInputGR;
+    if (raw[3] & 0x02) buttons |= 1u << kNs2ProButtonInputGL;
     return buttons;
 }
 
@@ -81,8 +59,144 @@ constexpr int16_t kLeftCenterTrimX = -23;
 constexpr int16_t kLeftCenterTrimY = 100;
 constexpr int16_t kRightCenterTrimX = 105;
 constexpr int16_t kRightCenterTrimY = 118;
+constexpr uint8_t kIdleCalibrationFrames = 32;
+constexpr int kIdleStickThreshold = 120;
+constexpr int16_t kIdleGyroThreshold = 800;
 Ns2ProInputState g_latest_input_state{};
 bool g_have_latest_input_state = false;
+bool g_runtime_calibration_initialized = false;
+int16_t g_runtime_center_lx = 2048;
+int16_t g_runtime_center_ly = 2048;
+int16_t g_runtime_center_rx = 2048;
+int16_t g_runtime_center_ry = 2048;
+int16_t g_runtime_gyro_center_x = 0;
+int16_t g_runtime_gyro_center_y = 0;
+int16_t g_runtime_gyro_center_z = 0;
+uint8_t g_idle_calibration_frames = 0;
+int32_t g_idle_sum_lx = 0;
+int32_t g_idle_sum_ly = 0;
+int32_t g_idle_sum_rx = 0;
+int32_t g_idle_sum_ry = 0;
+int32_t g_idle_sum_gyro_x = 0;
+int32_t g_idle_sum_gyro_y = 0;
+int32_t g_idle_sum_gyro_z = 0;
+
+int16_t clamp_center_value(int value) {
+    return static_cast<int16_t>(std::clamp(value, 0, 4095));
+}
+
+int16_t runtime_center_to_effective_center(int16_t runtime_center, int16_t trim) {
+    return clamp_center_value(static_cast<int>(runtime_center) + static_cast<int>(trim));
+}
+
+int16_t raw_center_to_runtime_center(int16_t raw_center, int16_t trim) {
+    return clamp_center_value(static_cast<int>(raw_center) - static_cast<int>(trim));
+}
+
+void reset_idle_calibration_samples() {
+    g_idle_calibration_frames = 0;
+    g_idle_sum_lx = 0;
+    g_idle_sum_ly = 0;
+    g_idle_sum_rx = 0;
+    g_idle_sum_ry = 0;
+    g_idle_sum_gyro_x = 0;
+    g_idle_sum_gyro_y = 0;
+    g_idle_sum_gyro_z = 0;
+}
+
+void ensure_runtime_calibration_initialized() {
+    if (g_runtime_calibration_initialized) {
+        return;
+    }
+
+    const auto &cfg = get_ns2pro_config();
+    g_runtime_center_lx = cfg.center_lx;
+    g_runtime_center_ly = cfg.center_ly;
+    g_runtime_center_rx = cfg.center_rx;
+    g_runtime_center_ry = cfg.center_ry;
+    g_runtime_gyro_center_x = cfg.gyro_center_x;
+    g_runtime_gyro_center_y = cfg.gyro_center_y;
+    g_runtime_gyro_center_z = cfg.gyro_center_z;
+    g_runtime_calibration_initialized = true;
+    reset_idle_calibration_samples();
+}
+
+bool is_idle_candidate(const Ns2ProInputState &state) {
+    if (state.buttons != 0) {
+        return false;
+    }
+
+    const int16_t left_center_x = runtime_center_to_effective_center(g_runtime_center_lx, kLeftCenterTrimX);
+    const int16_t left_center_y = runtime_center_to_effective_center(g_runtime_center_ly, kLeftCenterTrimY);
+    const int16_t right_center_x = runtime_center_to_effective_center(g_runtime_center_rx, kRightCenterTrimX);
+    const int16_t right_center_y = runtime_center_to_effective_center(g_runtime_center_ry, kRightCenterTrimY);
+
+    const bool sticks_centered =
+        std::abs(static_cast<int>(state.lx) - left_center_x) <= kIdleStickThreshold &&
+        std::abs(static_cast<int>(state.ly) - left_center_y) <= kIdleStickThreshold &&
+        std::abs(static_cast<int>(state.rx) - right_center_x) <= kIdleStickThreshold &&
+        std::abs(static_cast<int>(state.ry) - right_center_y) <= kIdleStickThreshold;
+    if (!sticks_centered) {
+        return false;
+    }
+
+    return
+        std::abs(state.gyro_x - g_runtime_gyro_center_x) <= kIdleGyroThreshold &&
+        std::abs(state.gyro_y - g_runtime_gyro_center_y) <= kIdleGyroThreshold &&
+        std::abs(state.gyro_z - g_runtime_gyro_center_z) <= kIdleGyroThreshold;
+}
+
+void update_idle_auto_calibration(const Ns2ProInputState &raw_state) {
+    ensure_runtime_calibration_initialized();
+    const auto &cfg = get_ns2pro_config();
+    if (!cfg.auto_stick_center && !cfg.auto_gyro_center) {
+        reset_idle_calibration_samples();
+        return;
+    }
+
+    if (!is_idle_candidate(raw_state)) {
+        reset_idle_calibration_samples();
+        return;
+    }
+
+    g_idle_sum_lx += raw_state.lx;
+    g_idle_sum_ly += raw_state.ly;
+    g_idle_sum_rx += raw_state.rx;
+    g_idle_sum_ry += raw_state.ry;
+    g_idle_sum_gyro_x += raw_state.gyro_x;
+    g_idle_sum_gyro_y += raw_state.gyro_y;
+    g_idle_sum_gyro_z += raw_state.gyro_z;
+    g_idle_calibration_frames += 1;
+
+    if (g_idle_calibration_frames < kIdleCalibrationFrames) {
+        return;
+    }
+
+    if (cfg.auto_stick_center) {
+        g_runtime_center_lx = raw_center_to_runtime_center(
+            static_cast<int16_t>(g_idle_sum_lx / kIdleCalibrationFrames),
+            kLeftCenterTrimX
+        );
+        g_runtime_center_ly = raw_center_to_runtime_center(
+            static_cast<int16_t>(g_idle_sum_ly / kIdleCalibrationFrames),
+            kLeftCenterTrimY
+        );
+        g_runtime_center_rx = raw_center_to_runtime_center(
+            static_cast<int16_t>(g_idle_sum_rx / kIdleCalibrationFrames),
+            kRightCenterTrimX
+        );
+        g_runtime_center_ry = raw_center_to_runtime_center(
+            static_cast<int16_t>(g_idle_sum_ry / kIdleCalibrationFrames),
+            kRightCenterTrimY
+        );
+    }
+    if (cfg.auto_gyro_center) {
+        g_runtime_gyro_center_x = static_cast<int16_t>(g_idle_sum_gyro_x / kIdleCalibrationFrames);
+        g_runtime_gyro_center_y = static_cast<int16_t>(g_idle_sum_gyro_y / kIdleCalibrationFrames);
+        g_runtime_gyro_center_z = static_cast<int16_t>(g_idle_sum_gyro_z / kIdleCalibrationFrames);
+    }
+    reset_idle_calibration_samples();
+}
 
 StickVector normalize_stick_pair(
     uint16_t raw_x,
@@ -138,10 +252,10 @@ uint8_t stick_component_to_ds5(double component) {
 }
 
 uint8_t encode_hat(uint32_t buttons) {
-    const bool up = (buttons & ButtonUp) != 0;
-    const bool down = (buttons & ButtonDown) != 0;
-    const bool left = (buttons & ButtonLeft) != 0;
-    const bool right = (buttons & ButtonRight) != 0;
+    const bool up = (buttons & (1u << kButtonMappingTargetUp)) != 0;
+    const bool down = (buttons & (1u << kButtonMappingTargetDown)) != 0;
+    const bool left = (buttons & (1u << kButtonMappingTargetLeft)) != 0;
+    const bool right = (buttons & (1u << kButtonMappingTargetRight)) != 0;
 
     if (up && right) return 1;
     if (right && down) return 3;
@@ -185,9 +299,9 @@ bool ns2pro_parse_input_report(const uint8_t *payload, size_t len, Ns2ProInputSt
         return false;
     }
 
-    const auto &cfg = get_ns2pro_config();
+    ensure_runtime_calibration_initialized();
     Ns2ProInputState state{};
-    state.buttons = map_buttons(payload + 0x04);
+    const uint32_t physical_buttons = map_buttons(payload + 0x04);
     state.lx = unpack12_x(payload + 0x0a);
     state.ly = unpack12_y(payload + 0x0a);
     state.rx = unpack12_x(payload + 0x0d);
@@ -206,13 +320,11 @@ bool ns2pro_parse_input_report(const uint8_t *payload, size_t len, Ns2ProInputSt
     state.external_power = true;
     state.charging = read_u8(payload, 0x21, len, 0) == 0x34;
     state.connected = true;
-
-    if (cfg.auto_stick_center) {
-        if (cfg.center_lx >= 0) state.lx = static_cast<uint16_t>(state.lx);
-        if (cfg.center_ly >= 0) state.ly = static_cast<uint16_t>(state.ly);
-        if (cfg.center_rx >= 0) state.rx = static_cast<uint16_t>(state.rx);
-        if (cfg.center_ry >= 0) state.ry = static_cast<uint16_t>(state.ry);
-    }
+    update_idle_auto_calibration(state);
+    state.buttons = button_mapping_apply_ns2pro(physical_buttons);
+    state.gyro_x = static_cast<int16_t>(state.gyro_x - g_runtime_gyro_center_x);
+    state.gyro_y = static_cast<int16_t>(state.gyro_y - g_runtime_gyro_center_y);
+    state.gyro_z = static_cast<int16_t>(state.gyro_z - g_runtime_gyro_center_z);
 
     *out_state = state;
     g_latest_input_state = state;
@@ -234,10 +346,11 @@ void ns2pro_build_ds5_input_report(const Ns2ProInputState &state, uint8_t *repor
 
     memcpy(report63, kDefaultReport, sizeof(kDefaultReport));
     const auto &cfg = get_ns2pro_config();
-    const int16_t left_center_x = static_cast<int16_t>(std::clamp<int>(cfg.center_lx + kLeftCenterTrimX, 0, 4095));
-    const int16_t left_center_y = static_cast<int16_t>(std::clamp<int>(cfg.center_ly + kLeftCenterTrimY, 0, 4095));
-    const int16_t right_center_x = static_cast<int16_t>(std::clamp<int>(cfg.center_rx + kRightCenterTrimX, 0, 4095));
-    const int16_t right_center_y = static_cast<int16_t>(std::clamp<int>(cfg.center_ry + kRightCenterTrimY, 0, 4095));
+    ensure_runtime_calibration_initialized();
+    const int16_t left_center_x = runtime_center_to_effective_center(g_runtime_center_lx, kLeftCenterTrimX);
+    const int16_t left_center_y = runtime_center_to_effective_center(g_runtime_center_ly, kLeftCenterTrimY);
+    const int16_t right_center_x = runtime_center_to_effective_center(g_runtime_center_rx, kRightCenterTrimX);
+    const int16_t right_center_y = runtime_center_to_effective_center(g_runtime_center_ry, kRightCenterTrimY);
 
     const StickVector left_stick = normalize_stick_pair(
         state.lx,
@@ -270,33 +383,36 @@ void ns2pro_build_ds5_input_report(const Ns2ProInputState &state, uint8_t *repor
     report63[1] = stick_component_to_ds5(left_stick.y);
     report63[2] = stick_component_to_ds5(right_stick.x);
     report63[3] = stick_component_to_ds5(right_stick.y);
-    report63[4] = (state.buttons & ButtonZL) ? 0xff : 0x00;
-    report63[5] = (state.buttons & ButtonZR) ? 0xff : 0x00;
+    report63[4] = (state.buttons & (1u << kButtonMappingTargetL2)) ? 0xff : 0x00;
+    report63[5] = (state.buttons & (1u << kButtonMappingTargetR2)) ? 0xff : 0x00;
     report63[6] = static_cast<uint8_t>(tick_counter & 0xff);
 
     uint8_t buttons0 = encode_hat(state.buttons);
-    if (state.buttons & ButtonY) buttons0 |= 1u << 4; // Square
-    if (state.buttons & ButtonB) buttons0 |= 1u << 5; // Cross
-    if (state.buttons & ButtonA) buttons0 |= 1u << 6; // Circle
-    if (state.buttons & ButtonX) buttons0 |= 1u << 7; // Triangle
+    if (state.buttons & (1u << kButtonMappingTargetSquare)) buttons0 |= 1u << 4;
+    if (state.buttons & (1u << kButtonMappingTargetCross)) buttons0 |= 1u << 5;
+    if (state.buttons & (1u << kButtonMappingTargetCircle)) buttons0 |= 1u << 6;
+    if (state.buttons & (1u << kButtonMappingTargetTriangle)) buttons0 |= 1u << 7;
     report63[7] = buttons0;
 
     uint8_t buttons1 = 0;
-    if (state.buttons & ButtonL) buttons1 |= 1u << 0;
-    if (state.buttons & ButtonR) buttons1 |= 1u << 1;
-    if (state.buttons & ButtonZL) buttons1 |= 1u << 2;
-    if (state.buttons & ButtonZR) buttons1 |= 1u << 3;
-    if (state.buttons & ButtonMinus) buttons1 |= 1u << 4;
-    if (state.buttons & ButtonPlus) buttons1 |= 1u << 5;
-    if (state.buttons & ButtonLeftStick) buttons1 |= 1u << 6;
-    if (state.buttons & ButtonRightStick) buttons1 |= 1u << 7;
+    if (state.buttons & (1u << kButtonMappingTargetL1)) buttons1 |= 1u << 0;
+    if (state.buttons & (1u << kButtonMappingTargetR1)) buttons1 |= 1u << 1;
+    if (state.buttons & (1u << kButtonMappingTargetL2)) buttons1 |= 1u << 2;
+    if (state.buttons & (1u << kButtonMappingTargetR2)) buttons1 |= 1u << 3;
+    if (state.buttons & (1u << kButtonMappingTargetCreate)) buttons1 |= 1u << 4;
+    if (state.buttons & (1u << kButtonMappingTargetOptions)) buttons1 |= 1u << 5;
+    if (state.buttons & (1u << kButtonMappingTargetL3)) buttons1 |= 1u << 6;
+    if (state.buttons & (1u << kButtonMappingTargetR3)) buttons1 |= 1u << 7;
     report63[8] = buttons1;
 
     uint8_t buttons2 = 0;
-    if (state.buttons & ButtonHome) buttons2 |= 1u << 0;
-    if (state.buttons & ButtonCapture) buttons2 |= 1u << 1;
-    if (state.buttons & ButtonGL) buttons2 |= 1u << 6;
-    if (state.buttons & ButtonGR) buttons2 |= 1u << 7;
+    if (state.buttons & (1u << kButtonMappingTargetPs)) buttons2 |= 1u << 0;
+    if (state.buttons & (1u << kButtonMappingTargetTouchpad)) buttons2 |= 1u << 1;
+    if (state.buttons & (1u << kButtonMappingTargetMute)) buttons2 |= 1u << 2;
+    if (state.buttons & (1u << kButtonMappingTargetLeftFunction)) buttons2 |= 1u << 4;
+    if (state.buttons & (1u << kButtonMappingTargetRightFunction)) buttons2 |= 1u << 5;
+    if (state.buttons & (1u << kButtonMappingTargetLeftPaddle)) buttons2 |= 1u << 6;
+    if (state.buttons & (1u << kButtonMappingTargetRightPaddle)) buttons2 |= 1u << 7;
     report63[9] = buttons2;
 
     write_i16(report63, 15, state.gyro_x);
@@ -318,10 +434,35 @@ bool ns2pro_calibrate_stick_center_from_latest() {
     }
 
     auto cfg = get_ns2pro_config();
-    cfg.center_lx = static_cast<int16_t>(std::clamp<int>(g_latest_input_state.lx, 0, 4095));
-    cfg.center_ly = static_cast<int16_t>(std::clamp<int>(g_latest_input_state.ly, 0, 4095));
-    cfg.center_rx = static_cast<int16_t>(std::clamp<int>(g_latest_input_state.rx, 0, 4095));
-    cfg.center_ry = static_cast<int16_t>(std::clamp<int>(g_latest_input_state.ry, 0, 4095));
+    cfg.center_lx = raw_center_to_runtime_center(
+        static_cast<int16_t>(std::clamp<int>(g_latest_input_state.lx, 0, 4095)),
+        kLeftCenterTrimX
+    );
+    cfg.center_ly = raw_center_to_runtime_center(
+        static_cast<int16_t>(std::clamp<int>(g_latest_input_state.ly, 0, 4095)),
+        kLeftCenterTrimY
+    );
+    cfg.center_rx = raw_center_to_runtime_center(
+        static_cast<int16_t>(std::clamp<int>(g_latest_input_state.rx, 0, 4095)),
+        kRightCenterTrimX
+    );
+    cfg.center_ry = raw_center_to_runtime_center(
+        static_cast<int16_t>(std::clamp<int>(g_latest_input_state.ry, 0, 4095)),
+        kRightCenterTrimY
+    );
     set_ns2pro_config(cfg);
     return true;
+}
+
+void ns2pro_reset_runtime_calibration_from_config() {
+    const auto &cfg = get_ns2pro_config();
+    g_runtime_center_lx = cfg.center_lx;
+    g_runtime_center_ly = cfg.center_ly;
+    g_runtime_center_rx = cfg.center_rx;
+    g_runtime_center_ry = cfg.center_ry;
+    g_runtime_gyro_center_x = cfg.gyro_center_x;
+    g_runtime_gyro_center_y = cfg.gyro_center_y;
+    g_runtime_gyro_center_z = cfg.gyro_center_z;
+    g_runtime_calibration_initialized = true;
+    reset_idle_calibration_samples();
 }
