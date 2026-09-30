@@ -13,8 +13,19 @@
 #include "hardware/sync.h"
 #include "pico_led.h"
 
+#if __has_include("pico/btstack_flash_bank.h")
+#include "pico/btstack_flash_bank.h"
+#endif
+
 constexpr uint32_t CONFIG_MAGIC = 0x66ccff00;
 constexpr uint16_t CONFIG_VERSION = 3;
+// Flash map (from the end of flash, one 4 KiB sector each):
+//   -1 sector : main config (this file)
+//   -2, -3    : BTstack BLE bond / link-key TLV store (pico_btstack_flash_bank)
+//   -4 sector : NS2Pro config (ns2pro_config.cpp)
+//   -5 sector : button mapping (button_mapping.cpp)
+// The last sector must stay free of the BLE bond store, which is why the bond
+// bank sits two sectors lower and the other stores were moved below it.
 constexpr uint32_t CONFIG_FLASH_OFFSET = PICO_FLASH_SIZE_BYTES - FLASH_SECTOR_SIZE;
 static Config config{};
 bool is_dse = false;
@@ -24,6 +35,13 @@ bool is_dse = false;
 static_assert(sizeof(Config) <= FLASH_PAGE_SIZE);
 // 配置区起始地址必须按 flash sector 对齐。
 static_assert(CONFIG_FLASH_OFFSET % FLASH_SECTOR_SIZE == 0);
+#if defined(PICO_FLASH_BANK_STORAGE_OFFSET) && defined(PICO_FLASH_BANK_TOTAL_SIZE)
+static_assert(
+    CONFIG_FLASH_OFFSET + FLASH_SECTOR_SIZE <= PICO_FLASH_BANK_STORAGE_OFFSET ||
+        CONFIG_FLASH_OFFSET >= PICO_FLASH_BANK_STORAGE_OFFSET + PICO_FLASH_BANK_TOTAL_SIZE,
+    "Main config sector must not overlap the BTstack BLE flash bank"
+);
+#endif
 
 uint32_t calc_config_crc(const Config &con) {
     return crc32(reinterpret_cast<const uint8_t *>(&con.body), sizeof(Config_body));

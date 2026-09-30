@@ -5,7 +5,9 @@
 #include <cstring>
 
 #include "button_mapping.h"
+#include "cmd.h"
 #include "ns2pro_config.h"
+#include "pico/time.h"
 
 namespace {
 
@@ -62,6 +64,37 @@ constexpr int16_t kRightCenterTrimY = 118;
 constexpr uint8_t kIdleCalibrationFrames = 32;
 constexpr int kIdleStickThreshold = 120;
 constexpr int16_t kIdleGyroThreshold = 800;
+// A window only counts as "still" when every sample stays inside a tight band.
+// The proximity gates above also accept a slow but steady pan/stick hold, so the
+// spread test is what separates real motion from a mounting offset.
+constexpr int kIdleStickMaxSpread = 24;
+// Largest automatic stick correction accepted from one window. Anything larger
+// is treated as motion (steady stick hold) instead of as a mounting offset.
+// kIdleStickThreshold already bounds the correction, this documents the limit.
+constexpr int kMaxAutoStickCenterStep = 120;
+// Corrections are ramped in a few counts per input frame instead of being
+// applied as a step, so the translated DS5 report never jumps.
+constexpr int kStickCenterSlewPerFrame = 2;
+constexpr int16_t kGyroCenterSlewPerFrame = 1;
+// NS2Pro gyro centering is manual only: the host arms it with
+// CMD_NS2PRO_CALIBRATE_GYRO_CENTER and the firmware samples one still window.
+// Nothing re-centers the gyro on its own, because continuously re-centering
+// while the user is aiming is what made the translated gyro jump.
+constexpr uint8_t kGyroCenterCalibrationPendingError = 0x43;
+constexpr uint8_t kGyroCenterCalibrationFailedError = 0x44;
+constexpr uint32_t kGyroCenterCalibrationTimeoutMs = 1200;
+// A held controller is never perfectly still, so a manual window tolerates a
+// little more shake than the automatic stick window before it restarts.
+constexpr int16_t kGyroCalibrationMaxSpread = 48;
+// Sanity bound for the sampled bias. A real gyro bias is a few dozen counts;
+// anything past this means the controller was rotating during the window.
+constexpr int16_t kGyroCalibrationMaxBias = 600;
+// NS2Pro accelerometer resolution measured on hardware (~4125 counts per g,
+// 544 still samples, p10..p90 = 4122..4127). A real DualSense reports 8192
+// counts per g, so raw values are rescaled instead of passed through.
+constexpr double kNs2ProAccelToDs5Scale = 8192.0 / 4125.0;
+constexpr double kDs5AccelMin = -32768.0;
+constexpr double kDs5AccelMax = 32767.0;
 Ns2ProInputState g_latest_input_state{};
 bool g_have_latest_input_state = false;
 bool g_runtime_calibration_initialized = false;
@@ -72,14 +105,42 @@ int16_t g_runtime_center_ry = 2048;
 int16_t g_runtime_gyro_center_x = 0;
 int16_t g_runtime_gyro_center_y = 0;
 int16_t g_runtime_gyro_center_z = 0;
+int16_t g_target_center_lx = 2048;
+int16_t g_target_center_ly = 2048;
+int16_t g_target_center_rx = 2048;
+int16_t g_target_center_ry = 2048;
+int16_t g_target_gyro_center_x = 0;
+int16_t g_target_gyro_center_y = 0;
+int16_t g_target_gyro_center_z = 0;
+// Stick auto centering runs at most once per session (boot, config update, or a
+// newly connected controller). Continuously re-centering while the user is
+// playing is what made the translated stick data jump.
+bool g_stick_auto_center_armed = true;
 uint8_t g_idle_calibration_frames = 0;
 int32_t g_idle_sum_lx = 0;
 int32_t g_idle_sum_ly = 0;
 int32_t g_idle_sum_rx = 0;
 int32_t g_idle_sum_ry = 0;
-int32_t g_idle_sum_gyro_x = 0;
-int32_t g_idle_sum_gyro_y = 0;
-int32_t g_idle_sum_gyro_z = 0;
+uint16_t g_idle_min_lx = 0;
+uint16_t g_idle_max_lx = 0;
+uint16_t g_idle_min_ly = 0;
+uint16_t g_idle_max_ly = 0;
+uint16_t g_idle_min_rx = 0;
+uint16_t g_idle_max_rx = 0;
+uint16_t g_idle_min_ry = 0;
+uint16_t g_idle_max_ry = 0;
+bool g_gyro_calibration_active = false;
+uint8_t g_gyro_calibration_frames = 0;
+uint32_t g_gyro_calibration_deadline_ms = 0;
+int32_t g_gyro_calibration_sum_x = 0;
+int32_t g_gyro_calibration_sum_y = 0;
+int32_t g_gyro_calibration_sum_z = 0;
+int16_t g_gyro_calibration_min_x = 0;
+int16_t g_gyro_calibration_max_x = 0;
+int16_t g_gyro_calibration_min_y = 0;
+int16_t g_gyro_calibration_max_y = 0;
+int16_t g_gyro_calibration_min_z = 0;
+int16_t g_gyro_calibration_max_z = 0;
 
 int16_t clamp_center_value(int value) {
     return static_cast<int16_t>(std::clamp(value, 0, 4095));
@@ -99,9 +160,43 @@ void reset_idle_calibration_samples() {
     g_idle_sum_ly = 0;
     g_idle_sum_rx = 0;
     g_idle_sum_ry = 0;
-    g_idle_sum_gyro_x = 0;
-    g_idle_sum_gyro_y = 0;
-    g_idle_sum_gyro_z = 0;
+}
+
+void reset_gyro_calibration_samples() {
+    g_gyro_calibration_frames = 0;
+    g_gyro_calibration_sum_x = 0;
+    g_gyro_calibration_sum_y = 0;
+    g_gyro_calibration_sum_z = 0;
+}
+
+int16_t step_toward(int16_t value, int16_t target, int max_step) {
+    const int diff = static_cast<int>(target) - static_cast<int>(value);
+    if (diff > max_step) {
+        return static_cast<int16_t>(static_cast<int>(value) + max_step);
+    }
+    if (diff < -max_step) {
+        return static_cast<int16_t>(static_cast<int>(value) - max_step);
+    }
+    return target;
+}
+
+// Convert NS2Pro accelerometer counts to DS5 counts (8192 counts per g).
+int16_t scale_accel_value(int16_t raw) {
+    const double scaled = std::round(static_cast<double>(raw) * kNs2ProAccelToDs5Scale);
+    return static_cast<int16_t>(std::clamp(scaled, kDs5AccelMin, kDs5AccelMax));
+}
+
+// Walk the effective centers toward the learned targets. Every input frame
+// calls this, so a correction fades in over a few dozen frames and the report
+// stays continuous.
+void apply_center_slew() {
+    g_runtime_center_lx = step_toward(g_runtime_center_lx, g_target_center_lx, kStickCenterSlewPerFrame);
+    g_runtime_center_ly = step_toward(g_runtime_center_ly, g_target_center_ly, kStickCenterSlewPerFrame);
+    g_runtime_center_rx = step_toward(g_runtime_center_rx, g_target_center_rx, kStickCenterSlewPerFrame);
+    g_runtime_center_ry = step_toward(g_runtime_center_ry, g_target_center_ry, kStickCenterSlewPerFrame);
+    g_runtime_gyro_center_x = step_toward(g_runtime_gyro_center_x, g_target_gyro_center_x, kGyroCenterSlewPerFrame);
+    g_runtime_gyro_center_y = step_toward(g_runtime_gyro_center_y, g_target_gyro_center_y, kGyroCenterSlewPerFrame);
+    g_runtime_gyro_center_z = step_toward(g_runtime_gyro_center_z, g_target_gyro_center_z, kGyroCenterSlewPerFrame);
 }
 
 void ensure_runtime_calibration_initialized() {
@@ -109,16 +204,7 @@ void ensure_runtime_calibration_initialized() {
         return;
     }
 
-    const auto &cfg = get_ns2pro_config();
-    g_runtime_center_lx = cfg.center_lx;
-    g_runtime_center_ly = cfg.center_ly;
-    g_runtime_center_rx = cfg.center_rx;
-    g_runtime_center_ry = cfg.center_ry;
-    g_runtime_gyro_center_x = cfg.gyro_center_x;
-    g_runtime_gyro_center_y = cfg.gyro_center_y;
-    g_runtime_gyro_center_z = cfg.gyro_center_z;
-    g_runtime_calibration_initialized = true;
-    reset_idle_calibration_samples();
+    ns2pro_reset_runtime_calibration_from_config();
 }
 
 bool is_idle_candidate(const Ns2ProInputState &state) {
@@ -146,10 +232,78 @@ bool is_idle_candidate(const Ns2ProInputState &state) {
         std::abs(state.gyro_z - g_runtime_gyro_center_z) <= kIdleGyroThreshold;
 }
 
-void update_idle_auto_calibration(const Ns2ProInputState &raw_state) {
+void record_idle_sample(const Ns2ProInputState &raw_state) {
+    if (g_idle_calibration_frames == 0) {
+        g_idle_min_lx = g_idle_max_lx = raw_state.lx;
+        g_idle_min_ly = g_idle_max_ly = raw_state.ly;
+        g_idle_min_rx = g_idle_max_rx = raw_state.rx;
+        g_idle_min_ry = g_idle_max_ry = raw_state.ry;
+    } else {
+        g_idle_min_lx = std::min(g_idle_min_lx, raw_state.lx);
+        g_idle_max_lx = std::max(g_idle_max_lx, raw_state.lx);
+        g_idle_min_ly = std::min(g_idle_min_ly, raw_state.ly);
+        g_idle_max_ly = std::max(g_idle_max_ly, raw_state.ly);
+        g_idle_min_rx = std::min(g_idle_min_rx, raw_state.rx);
+        g_idle_max_rx = std::max(g_idle_max_rx, raw_state.rx);
+        g_idle_min_ry = std::min(g_idle_min_ry, raw_state.ry);
+        g_idle_max_ry = std::max(g_idle_max_ry, raw_state.ry);
+    }
+
+    g_idle_sum_lx += raw_state.lx;
+    g_idle_sum_ly += raw_state.ly;
+    g_idle_sum_rx += raw_state.rx;
+    g_idle_sum_ry += raw_state.ry;
+    g_idle_calibration_frames += 1;
+}
+
+bool idle_stick_window_is_still() {
+    return
+        (g_idle_max_lx - g_idle_min_lx) <= kIdleStickMaxSpread &&
+        (g_idle_max_ly - g_idle_min_ly) <= kIdleStickMaxSpread &&
+        (g_idle_max_rx - g_idle_min_rx) <= kIdleStickMaxSpread &&
+        (g_idle_max_ry - g_idle_min_ry) <= kIdleStickMaxSpread;
+}
+
+bool learn_stick_centers_from_window() {
+    if (!idle_stick_window_is_still()) {
+        return false;
+    }
+
+    const int16_t mean_lx = static_cast<int16_t>(g_idle_sum_lx / kIdleCalibrationFrames);
+    const int16_t mean_ly = static_cast<int16_t>(g_idle_sum_ly / kIdleCalibrationFrames);
+    const int16_t mean_rx = static_cast<int16_t>(g_idle_sum_rx / kIdleCalibrationFrames);
+    const int16_t mean_ry = static_cast<int16_t>(g_idle_sum_ry / kIdleCalibrationFrames);
+
+    const int16_t next_lx = raw_center_to_runtime_center(mean_lx, kLeftCenterTrimX);
+    const int16_t next_ly = raw_center_to_runtime_center(mean_ly, kLeftCenterTrimY);
+    const int16_t next_rx = raw_center_to_runtime_center(mean_rx, kRightCenterTrimX);
+    const int16_t next_ry = raw_center_to_runtime_center(mean_ry, kRightCenterTrimY);
+
+    if (std::abs(static_cast<int>(next_lx) - static_cast<int>(g_runtime_center_lx)) > kMaxAutoStickCenterStep ||
+        std::abs(static_cast<int>(next_ly) - static_cast<int>(g_runtime_center_ly)) > kMaxAutoStickCenterStep ||
+        std::abs(static_cast<int>(next_rx) - static_cast<int>(g_runtime_center_rx)) > kMaxAutoStickCenterStep ||
+        std::abs(static_cast<int>(next_ry) - static_cast<int>(g_runtime_center_ry)) > kMaxAutoStickCenterStep) {
+        return false;
+    }
+
+    g_target_center_lx = next_lx;
+    g_target_center_ly = next_ly;
+    g_target_center_rx = next_rx;
+    g_target_center_ry = next_ry;
+    return true;
+}
+
+void update_idle_stick_auto_centering(const Ns2ProInputState &raw_state) {
     ensure_runtime_calibration_initialized();
+
+    // One shot per session: after a successful learn the runtime center only
+    // follows the slew, so playing can never re-center the sticks mid-game.
+    if (!g_stick_auto_center_armed) {
+        return;
+    }
+
     const auto &cfg = get_ns2pro_config();
-    if (!cfg.auto_stick_center && !cfg.auto_gyro_center) {
+    if (!cfg.auto_stick_center) {
         reset_idle_calibration_samples();
         return;
     }
@@ -159,43 +313,98 @@ void update_idle_auto_calibration(const Ns2ProInputState &raw_state) {
         return;
     }
 
-    g_idle_sum_lx += raw_state.lx;
-    g_idle_sum_ly += raw_state.ly;
-    g_idle_sum_rx += raw_state.rx;
-    g_idle_sum_ry += raw_state.ry;
-    g_idle_sum_gyro_x += raw_state.gyro_x;
-    g_idle_sum_gyro_y += raw_state.gyro_y;
-    g_idle_sum_gyro_z += raw_state.gyro_z;
-    g_idle_calibration_frames += 1;
+    record_idle_sample(raw_state);
 
     if (g_idle_calibration_frames < kIdleCalibrationFrames) {
         return;
     }
 
-    if (cfg.auto_stick_center) {
-        g_runtime_center_lx = raw_center_to_runtime_center(
-            static_cast<int16_t>(g_idle_sum_lx / kIdleCalibrationFrames),
-            kLeftCenterTrimX
-        );
-        g_runtime_center_ly = raw_center_to_runtime_center(
-            static_cast<int16_t>(g_idle_sum_ly / kIdleCalibrationFrames),
-            kLeftCenterTrimY
-        );
-        g_runtime_center_rx = raw_center_to_runtime_center(
-            static_cast<int16_t>(g_idle_sum_rx / kIdleCalibrationFrames),
-            kRightCenterTrimX
-        );
-        g_runtime_center_ry = raw_center_to_runtime_center(
-            static_cast<int16_t>(g_idle_sum_ry / kIdleCalibrationFrames),
-            kRightCenterTrimY
-        );
-    }
-    if (cfg.auto_gyro_center) {
-        g_runtime_gyro_center_x = static_cast<int16_t>(g_idle_sum_gyro_x / kIdleCalibrationFrames);
-        g_runtime_gyro_center_y = static_cast<int16_t>(g_idle_sum_gyro_y / kIdleCalibrationFrames);
-        g_runtime_gyro_center_z = static_cast<int16_t>(g_idle_sum_gyro_z / kIdleCalibrationFrames);
+    if (learn_stick_centers_from_window()) {
+        g_stick_auto_center_armed = false;
     }
     reset_idle_calibration_samples();
+}
+
+bool gyro_calibration_window_is_still() {
+    return
+        (g_gyro_calibration_max_x - g_gyro_calibration_min_x) <= kGyroCalibrationMaxSpread &&
+        (g_gyro_calibration_max_y - g_gyro_calibration_min_y) <= kGyroCalibrationMaxSpread &&
+        (g_gyro_calibration_max_z - g_gyro_calibration_min_z) <= kGyroCalibrationMaxSpread;
+}
+
+void record_gyro_calibration_sample(const Ns2ProInputState &raw_state) {
+    if (g_gyro_calibration_frames == 0) {
+        g_gyro_calibration_min_x = g_gyro_calibration_max_x = raw_state.gyro_x;
+        g_gyro_calibration_min_y = g_gyro_calibration_max_y = raw_state.gyro_y;
+        g_gyro_calibration_min_z = g_gyro_calibration_max_z = raw_state.gyro_z;
+    } else {
+        g_gyro_calibration_min_x = std::min(g_gyro_calibration_min_x, raw_state.gyro_x);
+        g_gyro_calibration_max_x = std::max(g_gyro_calibration_max_x, raw_state.gyro_x);
+        g_gyro_calibration_min_y = std::min(g_gyro_calibration_min_y, raw_state.gyro_y);
+        g_gyro_calibration_max_y = std::max(g_gyro_calibration_max_y, raw_state.gyro_y);
+        g_gyro_calibration_min_z = std::min(g_gyro_calibration_min_z, raw_state.gyro_z);
+        g_gyro_calibration_max_z = std::max(g_gyro_calibration_max_z, raw_state.gyro_z);
+    }
+
+    g_gyro_calibration_sum_x += raw_state.gyro_x;
+    g_gyro_calibration_sum_y += raw_state.gyro_y;
+    g_gyro_calibration_sum_z += raw_state.gyro_z;
+    g_gyro_calibration_frames += 1;
+}
+
+void finish_gyro_center_calibration(bool success) {
+    g_gyro_calibration_active = false;
+    reset_gyro_calibration_samples();
+    pico_cmd_set_last_error(success ? 0 : kGyroCenterCalibrationFailedError);
+}
+
+void commit_gyro_center_calibration() {
+    const int16_t mean_x = static_cast<int16_t>(g_gyro_calibration_sum_x / kIdleCalibrationFrames);
+    const int16_t mean_y = static_cast<int16_t>(g_gyro_calibration_sum_y / kIdleCalibrationFrames);
+    const int16_t mean_z = static_cast<int16_t>(g_gyro_calibration_sum_z / kIdleCalibrationFrames);
+
+    if (std::abs(mean_x) > kGyroCalibrationMaxBias ||
+        std::abs(mean_y) > kGyroCalibrationMaxBias ||
+        std::abs(mean_z) > kGyroCalibrationMaxBias) {
+        finish_gyro_center_calibration(false);
+        return;
+    }
+
+    auto cfg = get_ns2pro_config();
+    cfg.gyro_center_x = mean_x;
+    cfg.gyro_center_y = mean_y;
+    cfg.gyro_center_z = mean_z;
+    set_ns2pro_config(cfg);
+    finish_gyro_center_calibration(true);
+}
+
+void update_gyro_center_calibration(const Ns2ProInputState &raw_state) {
+    if (!g_gyro_calibration_active) {
+        return;
+    }
+
+    if (to_ms_since_boot(get_absolute_time()) > g_gyro_calibration_deadline_ms) {
+        finish_gyro_center_calibration(false);
+        return;
+    }
+
+    // Unlike the automatic stick window this needs no stick or button gate: the
+    // user asked for the calibration, so only the gyro stillness and the bias
+    // sanity bound decide the outcome.
+    record_gyro_calibration_sample(raw_state);
+
+    if (g_gyro_calibration_frames < kIdleCalibrationFrames) {
+        return;
+    }
+
+    if (!gyro_calibration_window_is_still()) {
+        // The controller moved during the window: drop it and keep sampling
+        // until the deadline instead of failing on the first shaky frame.
+        reset_gyro_calibration_samples();
+        return;
+    }
+
+    commit_gyro_center_calibration();
 }
 
 StickVector normalize_stick_pair(
@@ -320,11 +529,19 @@ bool ns2pro_parse_input_report(const uint8_t *payload, size_t len, Ns2ProInputSt
     state.external_power = true;
     state.charging = read_u8(payload, 0x21, len, 0) == 0x34;
     state.connected = true;
-    update_idle_auto_calibration(state);
+    // Publish the mapped buttons before the idle check: the stillness gate must
+    // see real button state, otherwise auto centering runs while the user is
+    // aiming and shooting.
     state.buttons = button_mapping_apply_ns2pro(physical_buttons);
+    update_idle_stick_auto_centering(state);
+    update_gyro_center_calibration(state);
+    apply_center_slew();
     state.gyro_x = static_cast<int16_t>(state.gyro_x - g_runtime_gyro_center_x);
     state.gyro_y = static_cast<int16_t>(state.gyro_y - g_runtime_gyro_center_y);
     state.gyro_z = static_cast<int16_t>(state.gyro_z - g_runtime_gyro_center_z);
+    state.accel_x = scale_accel_value(state.accel_x);
+    state.accel_y = scale_accel_value(state.accel_y);
+    state.accel_z = scale_accel_value(state.accel_z);
 
     *out_state = state;
     g_latest_input_state = state;
@@ -454,6 +671,15 @@ bool ns2pro_calibrate_stick_center_from_latest() {
     return true;
 }
 
+void ns2pro_start_gyro_center_calibration() {
+    ensure_runtime_calibration_initialized();
+    g_gyro_calibration_deadline_ms =
+        to_ms_since_boot(get_absolute_time()) + kGyroCenterCalibrationTimeoutMs;
+    reset_gyro_calibration_samples();
+    g_gyro_calibration_active = true;
+    pico_cmd_set_last_error(kGyroCenterCalibrationPendingError);
+}
+
 void ns2pro_reset_runtime_calibration_from_config() {
     const auto &cfg = get_ns2pro_config();
     g_runtime_center_lx = cfg.center_lx;
@@ -463,6 +689,19 @@ void ns2pro_reset_runtime_calibration_from_config() {
     g_runtime_gyro_center_x = cfg.gyro_center_x;
     g_runtime_gyro_center_y = cfg.gyro_center_y;
     g_runtime_gyro_center_z = cfg.gyro_center_z;
+    g_target_center_lx = cfg.center_lx;
+    g_target_center_ly = cfg.center_ly;
+    g_target_center_rx = cfg.center_rx;
+    g_target_center_ry = cfg.center_ry;
+    g_target_gyro_center_x = cfg.gyro_center_x;
+    g_target_gyro_center_y = cfg.gyro_center_y;
+    g_target_gyro_center_z = cfg.gyro_center_z;
+    // A config update (manual calibration, controller connect, host settings)
+    // opens a fresh stick auto-center session. The gyro center only ever comes
+    // from the config, so it needs no session at all.
+    g_stick_auto_center_armed = true;
+    g_gyro_calibration_active = false;
     g_runtime_calibration_initialized = true;
     reset_idle_calibration_samples();
+    reset_gyro_calibration_samples();
 }

@@ -21,6 +21,10 @@
 #include "pico/time.h"
 #include "utils.h"
 
+// Defined after the anonymous namespace: used by the GATT/SM event handling
+// above to redo the handshake once the link is encrypted.
+void request_init_restart_after_security(uint32_t delay_ms);
+
 namespace {
 
 constexpr uint16_t kNintendoCompanyId = 0x0553;
@@ -36,6 +40,15 @@ constexpr uint16_t kFastConnLatency = 0;
 constexpr uint16_t kFastConnSupervisionTimeout = 100;
 constexpr uint32_t kHomeDisconnectHoldMs = 5000;
 constexpr uint32_t kAutoReconnectHoldoffMs = 6000;
+// A bonded controller wakes and advertises again when any button is pressed, so
+// the dongle has to keep scanning while it is not connected and has to drop a
+// link that stopped delivering notifications (otherwise a sleeping controller
+// leaves us "connected" forever and the wake scan never runs again).
+constexpr uint32_t kStaleLinkTimeoutMs = 4000;
+// Wake scans prefer the saved target address and only fall back to any
+// Nintendo-looking candidate after this window (upstream Pro2 bridge behaviour,
+// see ble_central_start_wake_scan).
+constexpr uint32_t kSavedAddressPreferWindowMs = 1500;
 constexpr size_t kNs2ProOutputReportLen = 64;
 constexpr size_t kNs2ProBleRumblePacketLen = 42;
 constexpr size_t kNs2ProBleRumbleSideBlockLen = 16;
@@ -148,6 +161,13 @@ DiscoverStage g_discover_stage = DiscoverStage::None;
 absolute_time_t g_last_slot_switch{};
 uint32_t g_home_button_down_ms = 0;
 uint32_t g_auto_reconnect_resume_ms = 0;
+uint32_t g_last_notification_ms = 0;
+uint32_t g_scan_session_started_ms = 0;
+// Re-run the GATT discovery / init handshake once the link is encrypted. On a
+// wake reconnect we connect before encryption finishes, and the controller
+// rejects the config writes and CCCD subscriptions until it is encrypted.
+bool g_restart_init_pending = false;
+uint32_t g_restart_init_due_ms = 0;
 size_t g_init_index = 0;
 uint8_t g_uuid_fd2[16]{};
 uint8_t g_uuid_ack[16]{};
@@ -427,6 +447,7 @@ void begin_scan_session(bool prefer_new_target, bool alternate_with_classic, boo
     g_alternating_scan = alternate_with_classic;
     g_classic_scan_slot = start_with_classic_slot;
     g_last_slot_switch = get_absolute_time();
+    g_scan_session_started_ms = to_ms_since_boot(g_last_slot_switch);
 
     stop_ble_scan();
     if (g_alternating_scan) {
@@ -831,9 +852,23 @@ bool request_pending_rumble_write() {
 
 void on_query_complete(uint8_t att_status) {
     pico_cmd_set_ns2pro_ble_gatt_debug(att_status, static_cast<uint8_t>(g_discover_stage));
+    // Log every step: the stage/att sequence is what tells us where a failing
+    // reconnect stops (the bridge status bytes alone are all-or-nothing).
+    std::printf("[NS2PRO_BLE] query complete stage=%u att=0x%02x\n",
+                static_cast<unsigned>(g_discover_stage), att_status);
     if (att_status != ATT_ERROR_SUCCESS) {
-        std::printf("[NS2PRO_BLE] query complete error stage=%u att=0x%02x\n",
-                    static_cast<unsigned>(g_discover_stage), att_status);
+        if (att_status == ATT_ERROR_INSUFFICIENT_AUTHENTICATION ||
+            att_status == ATT_ERROR_INSUFFICIENT_AUTHORIZATION ||
+            att_status == ATT_ERROR_INSUFFICIENT_ENCRYPTION ||
+            att_status == ATT_ERROR_INSUFFICIENT_ENCRYPTION_KEY_SIZE) {
+            // The controller wants an encrypted link first. Keep the connection
+            // and redo the handshake once encryption is up instead of giving up
+            // (this is the usual wake-reconnect failure).
+            std::printf("[NS2PRO_BLE] stage=%u needs encryption, retry after security\n",
+                        static_cast<unsigned>(g_discover_stage));
+            request_init_restart_after_security(400);
+            return;
+        }
         if (g_discover_stage == DiscoverStage::SubscribeAck ||
             g_discover_stage == DiscoverStage::SubscribeFd2) {
             set_ble_error(kBleErrorSubscribe);
@@ -955,6 +990,9 @@ void on_le_connection_complete(uint8_t *packet) {
         gap_subevent_le_connection_complete_get_peer_address_type(packet));
     g_active_target_valid = true;
     g_ble_connected = true;
+    g_last_notification_ms = to_ms_since_boot(get_absolute_time());
+    g_restart_init_pending = false;
+    g_input_stream_ready = false;
     reset_home_disconnect_tracking();
     std::printf("[NS2PRO_BLE] connected handle=0x%04x interval=%u latency=%u supervision=%u\n",
                 g_conn_handle,
@@ -986,17 +1024,25 @@ void on_adv_report(uint8_t *packet) {
         return;
     }
 
-    if (!g_pairing_prefer_new_target &&
+    const bool matches_saved_target =
         g_saved_target_valid &&
-        (address_type != g_saved_target_addr_type ||
-         std::memcmp(address, g_saved_target_addr, sizeof(g_saved_target_addr)) != 0)) {
-        return;
+        address_type == g_saved_target_addr_type &&
+        std::memcmp(address, g_saved_target_addr, sizeof(g_saved_target_addr)) == 0;
+    if (!g_pairing_prefer_new_target && g_saved_target_valid && !matches_saved_target) {
+        // Wake / auto-reconnect session: give the bonded controller a head start
+        // so we reconnect the right device first, then fall back to any
+        // Nintendo-looking candidate instead of scanning forever.
+        const uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+        if (now_ms - g_scan_session_started_ms < kSavedAddressPreferWindowMs) {
+            return;
+        }
     }
 
-    std::printf("[NS2PRO_BLE] candidate %s addr=%s type=%u\n",
+    std::printf("[NS2PRO_BLE] candidate %s addr=%s type=%u saved=%s\n",
                 name[0] ? name : "<unnamed>",
                 bd_addr_to_str(address),
-                static_cast<unsigned>(address_type));
+                static_cast<unsigned>(address_type),
+                matches_saved_target ? "yes" : "no");
     connect_to_candidate(address, address_type);
 }
 
@@ -1005,10 +1051,24 @@ void on_le_disconnect(uint8_t *packet) {
     if (handle != g_conn_handle) {
         return;
     }
-    pico_cmd_set_ns2pro_ble_disconnect_reason(hci_event_disconnection_complete_get_reason(packet));
+    const uint8_t reason = hci_event_disconnection_complete_get_reason(packet);
+    // The single most useful line when a reconnect fails: who ended the link and
+    // why (0x00 = our own local gap_disconnect, 0x08 = supervision timeout,
+    // 0x13 = controller terminated, 0x16 = local host terminated).
+    std::printf("[NS2PRO_BLE] disconnected handle=0x%04x reason=0x%02x stage=%u stream=%s\n",
+                handle,
+                reason,
+                static_cast<unsigned>(g_discover_stage),
+                g_input_stream_ready ? "yes" : "no");
+    pico_cmd_set_ns2pro_ble_disconnect_reason(reason);
     g_conn_handle = HCI_CON_HANDLE_INVALID;
     g_ble_connected = false;
     g_ble_connecting = false;
+    g_last_notification_ms = 0;
+    g_restart_init_pending = false;
+    // The next link starts from scratch: otherwise the stale-link watchdog and
+    // the init restart logic would treat it as an established stream.
+    g_input_stream_ready = false;
     reset_home_disconnect_tracking();
     clear_characteristics();
     reset_latest_input();
@@ -1069,20 +1129,30 @@ static void ns2pro_ble_packet_handler(uint8_t packet_type, uint16_t channel, uin
                     status,
                     reason
                 );
+                std::printf("[NS2PRO_BLE] pairing complete status=0x%02x reason=0x%02x\n",
+                            status, reason);
                 if (status != ERROR_CODE_SUCCESS &&
                     reason != SM_REASON_PAIRING_NOT_SUPPORTED) {
                     set_ble_error(kBleErrorPairing);
+                    return;
                 }
+                request_init_restart_after_security(200);
             }
             break;
         case SM_EVENT_REENCRYPTION_COMPLETE:
             if (sm_event_reencryption_complete_get_handle(packet) == g_conn_handle) {
                 const uint8_t status = sm_event_reencryption_complete_get_status(packet);
                 pico_cmd_set_ns2pro_ble_reencryption_status(status);
+                std::printf("[NS2PRO_BLE] reencryption complete status=0x%02x stage=%u stream=%s\n",
+                            status,
+                            static_cast<unsigned>(g_discover_stage),
+                            g_input_stream_ready ? "yes" : "no");
                 if (status != ERROR_CODE_SUCCESS &&
                     status != ERROR_CODE_PIN_OR_KEY_MISSING) {
                     set_ble_error(kBleErrorPairing);
+                    return;
                 }
+                request_init_restart_after_security(200);
             }
             break;
         case GATT_EVENT_CHARACTERISTIC_QUERY_RESULT: {
@@ -1113,10 +1183,14 @@ static void ns2pro_ble_packet_handler(uint8_t packet_type, uint16_t channel, uin
                                        ? gatt_event_indication_get_value(packet)
                                        : gatt_event_notification_get_value(packet);
             if (g_have_ack && value_handle == g_chr_ack.value_handle) {
+                g_last_notification_ms = to_ms_since_boot(get_absolute_time());
                 advance_init_from_ack();
                 break;
             }
             if (g_have_fd2 && value_handle == g_chr_fd2.value_handle) {
+                // Any notification proves the link is alive; the stale-link
+                // watchdog uses this to notice a controller that went to sleep.
+                g_last_notification_ms = to_ms_since_boot(get_absolute_time());
                 update_home_disconnect_state(value, value_length);
                 const size_t copy_len = std::min(static_cast<size_t>(value_length), sizeof(g_latest_input));
                 if (!is_duplicate_input_sample(value, copy_len)) {
@@ -1128,6 +1202,7 @@ static void ns2pro_ble_packet_handler(uint8_t packet_type, uint16_t channel, uin
                 if (!g_input_stream_ready || g_discover_stage != DiscoverStage::Ready) {
                     g_input_stream_ready = true;
                     g_discover_stage = DiscoverStage::Ready;
+                    std::printf("[NS2PRO_BLE] input stream ready (FD2 notifications flowing)\n");
                     pico_cmd_set_ns2pro_ble_state(NS2PRO_BLE_STATE_READY);
                     save_active_target_to_config();
                     request_fast_connection_parameters("ready");
@@ -1160,6 +1235,9 @@ void ns2pro_ble_init() {
     g_init_index = 0;
     g_auto_reconnect_suppressed = false;
     g_auto_reconnect_resume_ms = 0;
+    g_last_notification_ms = 0;
+    g_restart_init_pending = false;
+    g_scan_session_started_ms = 0;
     g_next_idle_task_time = nil_time;
     reset_home_disconnect_tracking();
     clear_characteristics();
@@ -1180,6 +1258,14 @@ void ns2pro_ble_stack_init() {
         parse_uuid128(kRumbleUuidText, g_uuid_rumble);
     }
 
+    // A controller that still holds a bond for our public address answers every
+    // re-pairing attempt with SM_REASON_PAIRING_NOT_SUPPORTED (0x05) and then
+    // either tolerates plaintext ATT or drops the link (0x3e), while we cannot
+    // re-encrypt because the matching key was lost. Presenting a stable random
+    // static address makes us look like a *new* host to it, so it accepts a fresh
+    // pairing (Secure Connections is enabled now) and stores a key again.
+    // Derived from the board id so the identity survives reboots and the bond we
+    // create stays valid.
     gatt_client_init();
     sm_init();
     sm_set_io_capabilities(IO_CAPABILITY_NO_INPUT_NO_OUTPUT);
@@ -1246,6 +1332,16 @@ static void maybe_begin_idle_pairing_session() {
     if (bt_classic_connected() || g_ble_connected || g_ble_connecting || g_pairing_requested) {
         return;
     }
+    const uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+    if (g_auto_reconnect_suppressed) {
+        if (now_ms < g_auto_reconnect_resume_ms) {
+            // The controller was disconnected on purpose (HOME long press), so
+            // stay quiet for the holdoff instead of grabbing it straight back.
+            return;
+        }
+        g_auto_reconnect_suppressed = false;
+        g_auto_reconnect_resume_ms = 0;
+    }
     ns2pro_ble_stack_init();
     if (!g_stack_ready) {
         return;
@@ -1253,10 +1349,10 @@ static void maybe_begin_idle_pairing_session() {
     bt_set_classic_pairing_service_enabled(true);
     pico_cmd_set_ns2pro_ble_last_error(0);
     pico_cmd_clear_ns2pro_ble_debug();
-    g_auto_reconnect_suppressed = false;
-    g_auto_reconnect_resume_ms = 0;
     g_next_idle_task_time = nil_time;
-    begin_scan_session(true, true, false);
+    std::printf("[NS2PRO_BLE] wake scan session saved_target=%s\n",
+                g_saved_target_valid ? "yes" : "no");
+    begin_scan_session(false, true, false);
 }
 
 void ns2pro_ble_clear_bond() {
@@ -1385,7 +1481,72 @@ void ns2pro_ble_on_classic_disconnect() {
     g_next_idle_task_time = nil_time;
 }
 
+// Ask for the discovery / init handshake to be redone after the link reaches a
+// secure state. Runs from the ble task so it never overlaps an in-flight GATT
+// query.
+void request_init_restart_after_security(uint32_t delay_ms) {
+    g_restart_init_pending = true;
+    g_restart_init_due_ms = to_ms_since_boot(get_absolute_time()) + delay_ms;
+}
+
+void maybe_restart_init_after_security() {
+    if (!g_restart_init_pending) {
+        return;
+    }
+    if (!g_ble_connected || g_conn_handle == HCI_CON_HANDLE_INVALID) {
+        g_restart_init_pending = false;
+        return;
+    }
+    if (g_input_stream_ready || g_discover_stage == DiscoverStage::Ready) {
+        g_restart_init_pending = false;
+        return;
+    }
+    if (to_ms_since_boot(get_absolute_time()) < g_restart_init_due_ms) {
+        return;
+    }
+
+    g_restart_init_pending = false;
+    std::printf("[NS2PRO_BLE] restarting init after security stage=%u\n",
+                static_cast<unsigned>(g_discover_stage));
+    pico_cmd_set_ns2pro_ble_last_error(0);
+    clear_characteristics();
+    g_input_stream_ready = false;
+    g_init_index = 0;
+    g_discover_stage = DiscoverStage::FindFd2;
+    start_next_discovery_step();
+}
+
+// A controller that sleeps or wanders off can leave us with a live-looking link
+// that never delivers notifications. Tear it down so the wake scan can run and
+// pick the controller up again the next time a button is pressed.
+void maybe_rebuild_stale_link() {
+    if (!g_ble_connected || g_conn_handle == HCI_CON_HANDLE_INVALID || g_last_notification_ms == 0) {
+        return;
+    }
+    // Only a link that already delivered input can go stale; the init handshake
+    // uses the ack channel and must not be cut short.
+    if (!g_input_stream_ready) {
+        return;
+    }
+
+    const uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+    if (now_ms - g_last_notification_ms < kStaleLinkTimeoutMs) {
+        return;
+    }
+
+    std::printf("[NS2PRO_BLE] link stale for %u ms, rebuilding handle=0x%04x\n",
+                static_cast<unsigned>(now_ms - g_last_notification_ms),
+                g_conn_handle);
+    g_last_notification_ms = 0;
+    g_auto_reconnect_suppressed = false;
+    g_auto_reconnect_resume_ms = 0;
+    gap_disconnect(g_conn_handle);
+}
+
 void ns2pro_ble_task() {
+    maybe_restart_init_after_security();
+    maybe_rebuild_stale_link();
+
     if (!g_runtime_initialized || g_ble_connected) {
         return;
     }
@@ -1421,8 +1582,13 @@ void ns2pro_ble_task() {
     }
 
     if (g_alternating_scan) {
-        if (absolute_time_diff_us(g_last_slot_switch, get_absolute_time()) >=
-            static_cast<int64_t>(kAlternateWindowMs) * 1000) {
+        if (g_ble_connecting) {
+            // Never hand the radio to the BR/EDR inquiry while an LE connection
+            // is being established: the inquiry makes the connect fail or drop
+            // right after establishment on the shared CYW43 radio.
+            bt_set_classic_pairing_enabled(false);
+        } else if (absolute_time_diff_us(g_last_slot_switch, get_absolute_time()) >=
+                   static_cast<int64_t>(kAlternateWindowMs) * 1000) {
             g_last_slot_switch = get_absolute_time();
             g_classic_scan_slot = !g_classic_scan_slot;
             if (g_classic_scan_slot) {

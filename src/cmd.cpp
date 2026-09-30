@@ -208,6 +208,11 @@ void pico_cmd_set(uint8_t report_id, uint8_t const *buffer, uint16_t bufsize) {
             pico_cmd_set_last_error(0x42);
         }
     }
+    if (buffer[0] == CMD_NS2PRO_CALIBRATE_GYRO_CENTER) {
+        // Sampling takes ~32 input frames; the translator owns the pending and
+        // result error codes (0x43 / 0x44 / 0) from here on.
+        ns2pro_start_gyro_center_calibration();
+    }
 }
 
 void pico_cmd_set_last_error(uint8_t error) {

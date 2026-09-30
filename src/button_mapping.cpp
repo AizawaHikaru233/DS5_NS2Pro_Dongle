@@ -7,11 +7,24 @@
 #include "hardware/sync.h"
 #include "utils.h"
 
+#if __has_include("pico/btstack_flash_bank.h")
+#include "pico/btstack_flash_bank.h"
+#endif
+
 namespace {
 
 constexpr uint32_t kButtonMappingMagic = 0x42544d50;
 constexpr uint16_t kButtonMappingVersion = 2;
-constexpr uint32_t kButtonMappingFlashOffset = PICO_FLASH_SIZE_BYTES - (3 * FLASH_SECTOR_SIZE);
+// Flash map (from the end of flash, one 4 KiB sector each):
+//   -1 sector : main config (config.cpp)
+//   -2, -3    : BTstack BLE bond / link-key TLV store (pico_btstack_flash_bank)
+//   -4 sector : NS2Pro config (ns2pro_config.cpp)
+//   -5 sector : button mapping (this file)
+// This used to sit in the BLE bond store's bank 0, so a rotation of the bond
+// log erased the saved mapping (RAM kept working, power cycle lost it).
+constexpr uint32_t kButtonMappingFlashOffset = PICO_FLASH_SIZE_BYTES - (5 * FLASH_SECTOR_SIZE);
+// Where the mapping lived before the collision was fixed, read once for migration.
+constexpr uint32_t kButtonMappingLegacyFlashOffset = PICO_FLASH_SIZE_BYTES - (3 * FLASH_SECTOR_SIZE);
 
 struct __attribute__((packed)) ButtonMappingBody {
     uint16_t config_version;
@@ -30,6 +43,13 @@ ButtonMappingStorage g_storage{};
 
 static_assert(sizeof(ButtonMappingStorage) <= FLASH_PAGE_SIZE);
 static_assert(kButtonMappingFlashOffset % FLASH_SECTOR_SIZE == 0);
+#if defined(PICO_FLASH_BANK_STORAGE_OFFSET) && defined(PICO_FLASH_BANK_TOTAL_SIZE)
+static_assert(
+    kButtonMappingFlashOffset + FLASH_SECTOR_SIZE <= PICO_FLASH_BANK_STORAGE_OFFSET ||
+        kButtonMappingFlashOffset >= PICO_FLASH_BANK_STORAGE_OFFSET + PICO_FLASH_BANK_TOTAL_SIZE,
+    "Button mapping sector must not overlap the BTstack BLE flash bank"
+);
+#endif
 
 uint32_t calc_crc(const ButtonMappingStorage &storage) {
     return crc32(reinterpret_cast<const uint8_t *>(&storage.body), sizeof(storage.body));
@@ -37,6 +57,14 @@ uint32_t calc_crc(const ButtonMappingStorage &storage) {
 
 const ButtonMappingStorage *flash_storage() {
     return reinterpret_cast<const ButtonMappingStorage *>(XIP_BASE + kButtonMappingFlashOffset);
+}
+
+const ButtonMappingStorage *legacy_flash_storage() {
+    return reinterpret_cast<const ButtonMappingStorage *>(XIP_BASE + kButtonMappingLegacyFlashOffset);
+}
+
+bool storage_is_usable(const ButtonMappingStorage &storage) {
+    return storage.magic == kButtonMappingMagic && storage.size == sizeof(ButtonMappingBody);
 }
 
 uint8_t default_ds5_target(uint8_t input) {
@@ -184,6 +212,17 @@ void button_mapping_default() {
 
 void button_mapping_load() {
     memcpy(&g_storage, flash_storage(), sizeof(g_storage));
+    if (!storage_is_usable(g_storage)) {
+        // Best effort migration from the pre-fix location, which the BLE bond
+        // store used to erase, so a saved mapping survives this flash map fix.
+        const ButtonMappingStorage *legacy = legacy_flash_storage();
+        if (legacy && storage_is_usable(*legacy)) {
+            memcpy(&g_storage, legacy, sizeof(g_storage));
+            validate_storage();
+            button_mapping_save();
+            return;
+        }
+    }
     validate_storage();
 }
 
